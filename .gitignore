@@ -1,0 +1,7 @@
+.zig-cache/
+.zig-global-cache/
+zig-out/
+zig-pkg/
+mise.local.toml
+.mise.local.toml
+.DS_Store

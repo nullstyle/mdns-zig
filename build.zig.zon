@@ -1,0 +1,20 @@
+.{
+    .name = .mdns,
+    .version = "0.1.0",
+    .fingerprint = 0x95a4f5913e7a1c59, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0-dev.1786+75044cb04",
+    .dependencies = .{},
+    // Consumer-facing archive only. tests/, spikes/ and interop/ stay out:
+    // build.zig returns early for dependency builds, so downstream never
+    // configures them (qmesh-zig rule).
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "README.md",
+        "CHANGELOG.md",
+        "LICENSE",
+        "src",
+        "examples",
+        "docs",
+    },
+}

@@ -1,0 +1,14 @@
+.{
+    .name = .mdns_consumer_test,
+    .version = "0.0.0",
+    .fingerprint = 0xd70ecf9b51b8e2a7,
+    .minimum_zig_version = "0.17.0-dev.1786+75044cb04",
+    .dependencies = .{
+        .mdns = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
