@@ -5,10 +5,14 @@ two mDNS sockets, plus the measured results of the M0 spikes. "Coexistence"
 means sharing UDP 5353 with the OS mDNS daemon. "cmsg" means socket
 ancillary data (`struct cmsghdr`), which carries the arrival interface.
 
-Only the macOS and Linux columns are v0.1 gates. **Linux, FreeBSD and
-OpenBSD columns are reviewed, not run**: each value was read from the
-pinned std or from an OS header and cross-checked against the plan, but no
-binary has exercised it yet (Linux runs in Lima `zig-uring` from M1 on).
+Only the macOS and Linux columns are v0.1 gates. The macOS column was
+filled by the M0 spikes and the M2 live runs on this Mac; the Linux column
+by the M2 runs of the cross-built `aarch64-linux-musl` binaries in the
+Lima VM `zig-uring` (see "Linux runs (M2)" below). **The FreeBSD and
+OpenBSD columns are compile-only, reviewed, not run**: each value was read
+from the pinned std or from an OS header and cross-checked against the
+plan, the library and `mdns-live` compile for `aarch64-freebsd` and
+`aarch64-openbsd`, but no binary has exercised them.
 
 ## Sources
 
@@ -29,13 +33,17 @@ binary has exercised it yet (Linux runs in Lima `zig-uring` from M1 on).
 - OpenBSD: `STD/c/openbsd.zig` (`IP` 312-356, `IPV6` 357-397) and `STD/c.zig`
   (`SO` 6847-6876, `cmsghdr` 4237-4274).
 - Values marked **(unverified)** come from the OS headers as remembered, not
-  from a file opened for this document.
+  from a file opened for this document. The FreeBSD and OpenBSD struct and
+  flag rows below were re-checked (M2 review) against the headers shipped in
+  the pinned toolchain under `lib/libc/include/{generic-freebsd,
+  generic-openbsd, aarch64-freebsd-none, aarch64-openbsd-none}` and cite
+  those files; "not run" still applies to both.
 
 ## Socket-level and IPv4 options
 
 | Item | macOS (Darwin) | Linux | FreeBSD | OpenBSD |
 |---|---|---|---|---|
-| Status | gate; M0 spikes run on this Mac | gate; reviewed, not run | reviewed, not run | reviewed, not run |
+| Status | gate; M0 spikes and M2 live runs on this Mac | gate; M2 runs in Lima `zig-uring` (Fedora 44, kernel 6.19.10, musl static binary) | compile-only, reviewed, not run | compile-only, reviewed, not run |
 | `SOL_SOCKET` | `0xffff` (`SDK/sys/socket.h:356`) | `1` on every arch except mips/sparc/alpha = `0xffff` (`linux.zig:5258-5261`) | `0xffff` (`c.zig:6641-6646`) | `0xffff` (`c.zig:6641-6646`) |
 | `SO_REUSEADDR` | `0x0004` (`sys/socket.h:124`) | `2` generic (`linux.zig:5175`); mips/alpha `0x0004`, sparc `4` | `0x0004` (`c.zig:6696`) | `0x0004` (`c.zig:6850`) |
 | `SO_REUSEPORT` | `0x0200` (`sys/socket.h:137`) | `15` generic (`linux.zig:5188`); mips/alpha `0x0200`, sparc `512` | `0x0200` (`c.zig:6703`); `SO_REUSEPORT_LB 0x10000` (`c.zig:6710`) not used | `0x0200` (`c.zig:6857`) |
@@ -50,7 +58,7 @@ binary has exercised it yet (Linux runs in Lima `zig-uring` from M1 on).
 | `IP_RECVIF` | `20` (`in.h:424`), alternative to PKTINFO | n/a | `20` (`freebsd.zig:420`) | `30` (`openbsd.zig:337`) |
 | `IP_RECVDSTADDR` | `7` (`in.h:411`) | n/a (`IP_PKTINFO` carries it) | `7` (`freebsd.zig:406`) | `7` (`openbsd.zig:319`) |
 | `IP_RECVTTL` | `24` (`in.h:431`) | `12` (`linux.zig:5308`) | `65` (`freebsd.zig:447`) | `31` (`openbsd.zig:338`) |
-| `IP_MULTICAST_ALL` | n/a | `49`, set to 0 so a socket only sees groups it joined (`linux.zig:5333`) | n/a | n/a |
+| `IP_MULTICAST_ALL` | n/a | `49`, set to 0 so a socket only sees groups it joined (`linux.zig:5333`); **effect measured** (M2): with no joins a wildcard `*:5353` socket saw 4 datagrams in 4 s at the default and 0 with the option at 0 | n/a | n/a |
 | `IP_MULTICAST_IFINDEX` | `66`, `int` ifindex (`in.h:460`); Darwin-only alternative to `ip_mreqn` for egress | n/a | n/a | n/a |
 
 ## IPv6 options
@@ -70,6 +78,7 @@ binary has exercised it yet (Linux runs in Lima `zig-uring` from M1 on).
 | `IPV6_RECVHOPLIMIT` | `37` (`in6.h:459`) | `51` (`linux.zig:5396`) | `37` (`freebsd.zig:501`) | `37` (`openbsd.zig:369`) |
 | `IPV6_HOPLIMIT` (cmsg type) | `47` = `IPV6_3542HOPLIMIT` (`in6.h:479,486`) | `52` (`linux.zig:5397`) | `47` (`freebsd.zig:511`) | `47` (`openbsd.zig:377`) |
 | `IPV6_RECVIF` | none; `IPV6_RECVPKTINFO` covers it | n/a | n/a | n/a |
+| `IPV6_MULTICAST_ALL` | n/a | `29` (`linux/in6.h`, kernel 4.20+; **not in `std.os.linux.IPV6`**, hard-coded), set to 0; **effect measured** (M2): with no v6 join `mdns-live --ifindex 1` received 6 `ff02::fb` datagrams from avahi on `eth0` before the option and 0 after; ENOPROTOOPT on older kernels is tolerated | n/a | n/a |
 
 Darwin header note: `netinet6/in6.h` exposes the RFC 3542 names only when
 `__APPLE_USE_RFC_3542` is defined and the RFC 2292 names only under
@@ -80,34 +89,35 @@ accepts the numbers regardless of the macro; we hard-code the 3542 set.
 
 | Item | macOS (Darwin) | Linux | FreeBSD | OpenBSD |
 |---|---|---|---|---|
-| `ip_mreq` | `{ in_addr multiaddr, in_addr interface }`, 8 bytes (`in.h:505-508`) | same layout (`(unverified)`: not declared in std; self-declared) | same (`(unverified)`) | same (`(unverified)`) |
-| `ip_mreqn` | `{ multiaddr, address, int ifindex }`, 12 bytes (`in.h:515-519`); accepted by `IP_MULTICAST_IF` | `{ multiaddr, address, int ifindex }`, 12 bytes (`(unverified)`: not in std; self-declared); the join struct we use | not in FreeBSD `in.h`; use `ip_mreq` (`(unverified)`) | present since 6.x (`(unverified)`); use `ip_mreq` for safety |
-| `ipv6_mreq` | `{ in6_addr multiaddr, unsigned ifindex }`, 20 bytes (`in6.h:538-541`) | same layout, 4-byte ifindex (`unsigned int` in glibc, `int` in the kernel uapi) (`(unverified)`: not in std) | same (`(unverified)`) | same (`(unverified)`) |
+| `ip_mreq` | `{ in_addr multiaddr, in_addr interface }`, 8 bytes (`in.h:505-508`) | same layout (not declared in std; self-declared; joins with `ip_mreqn` instead, see below) | same (`generic-freebsd/netinet/in.h:554-557`); the join struct we use there | same (`generic-openbsd/netinet/in.h:359-362`); the join struct we use there |
+| `ip_mreqn` | `{ multiaddr, address, int ifindex }`, 12 bytes (`in.h:515-519`); accepted by `IP_MULTICAST_IF` | `{ multiaddr, address, int ifindex }`, 12 bytes (not in std; self-declared); the join struct we use; **verified** (M2): `IP_ADD_MEMBERSHIP` by ifindex succeeded on `lo` and `eth0` and the joined groups delivered | declared (`generic-freebsd/netinet/in.h:564-568`) and accepted by `IP_MULTICAST_IF` (`in.h:445`, "struct in_addr *or* struct ip_mreqn"); the code still joins with `ip_mreq` (`has_ip_mreqn = false`) | declared (`generic-openbsd/netinet/in.h:364-368`); the code joins with `ip_mreq` |
+| `ipv6_mreq` | `{ in6_addr multiaddr, unsigned ifindex }`, 20 bytes (`in6.h:538-541`) | same layout, 4-byte ifindex (`unsigned int` in glibc, `int` in the kernel uapi) (not in std; **verified** by the M2 `eth0` join and delivery) | same (`generic-freebsd/netinet6/in6.h:539-542`) | same (`generic-openbsd/netinet6/in6.h:357-360`) |
 | `in_pktinfo` | `{ u32 ifindex, in_addr spec_dst, in_addr addr }` (`in.h:616-620`; `c.zig:4065-4074`) | `{ i32 ifindex, u32 spec_dst, u32 addr }` (`linux.zig:5471-5475`) | void (`c.zig:4065-4075`) | void (`c.zig:4065-4075`) |
 | `in6_pktinfo` | `{ [16]u8 addr, u32 ifindex }` (`in6.h:546-549`; `c.zig:4076-4090`) | `{ [16]u8 addr, i32 ifindex }` (`linux.zig:5478-5481`) | `{ [16]u8 addr, u32 ifindex }` (`c.zig:4076-4090`) | `{ [16]u8 addr, u32 ifindex }` (`c.zig:4076-4090`) |
-| `IP_RECVIF` cmsg payload | `struct sockaddr_dl` (`sdl_index` is the ifindex) | n/a | `struct sockaddr_dl` (`(unverified)`) | `struct sockaddr_dl` (`(unverified)`) |
+| `IP_RECVIF` cmsg payload | `struct sockaddr_dl` (`sdl_index` is the ifindex); not enabled (pktinfo is) | n/a | `struct sockaddr_dl` (`generic-freebsd/net/if_dl.h:58-67`: `sdl_len, sdl_family, u_short sdl_index, ..., sdl_data[46]`, 54 bytes, `_ALIGN`ed to 56 in the cmsg) | `struct sockaddr_dl` (`generic-openbsd/net/if_dl.h:59-68`: same head, `sdl_data[24]`, 32 bytes) |
 | `cmsghdr` | `{ socklen_t len, int level, int type }`, 12 bytes (`sys/socket.h:608-613`; `c.zig:4259-4274` `posix_cmsghdr`) | glibc: `{ usize len, i32 level, i32 type }` (`linux.zig:10913-10917`); musl on 64-bit: `socklen_t len` plus padding (`c.zig:4238`, `posix_cmsghdr`) | `posix_cmsghdr` (`c.zig:4242,4263-4274`) | `posix_cmsghdr` (`c.zig:4248,4263-4274`) |
-| cmsg alignment | **4**: `CMSG_LEN`/`CMSG_SPACE`/`CMSG_NXTHDR` use `__DARWIN_ALIGN32` (`sys/socket.h:643-674`; `arm/_param.h:20-21`, `i386/_param.h:44-45`); confirmed live by the M0 spike (kernel-filled `control_len` 40 for v4, 48 for v6, see below) | `@sizeOf(usize)` (`CMSG_ALIGN` rounds to `sizeof(size_t)`) (`(unverified)`) | `@sizeOf(usize)` (`_ALIGN`, register size) (`(unverified)`) | `@sizeOf(usize)` (`_ALIGN` = `sizeof(long)`) (`(unverified)`) |
+| cmsg alignment | **4**: `CMSG_LEN`/`CMSG_SPACE`/`CMSG_NXTHDR` use `__DARWIN_ALIGN32` (`sys/socket.h:643-674`; `arm/_param.h:20-21`, `i386/_param.h:44-45`); confirmed live by the M0 spike (kernel-filled `control_len` 40 for v4, 48 for v6, see below) | `@sizeOf(usize)` (`CMSG_ALIGN` rounds to `sizeof(size_t)`); consistent with the M2 runs (pktinfo ifindex decoded on 100% of v4 and v6 datagrams through the 8-byte walker; the kernel-filled `control_len` was not printed) | `@sizeOf(usize)`: `_ALIGNBYTES (sizeof(long long) - 1)` (`aarch64-freebsd-none/machine/_align.h:42-43`) | `@sizeOf(usize)`: `_ALIGNBYTES (sizeof(long) - 1)` (`aarch64-openbsd-none/machine/_types.h:53-55`) |
 | `getifaddrs`/`freeifaddrs` | libc, `SDK/ifaddrs.h:64-65`; not declared anywhere in `STD/c.zig` or `STD/posix.zig`, so `ifaces.zig` declares the externs itself | libc (glibc and musl); self-declared extern | libc; self-declared extern | libc; self-declared extern |
-| `struct ifaddrs` | `{ next, name, u32 flags, addr, netmask, dstaddr, data }` (`ifaddrs.h:36-44`) | glibc: `{ next, name, u32 flags, addr, netmask, ifa_ifu (broadaddr/dstaddr union), data }` (`(unverified)`); musl: same field order (`(unverified)`) | `{ next, name, u32 flags, addr, netmask, dstaddr, data }` (`(unverified)`) | `{ next, name, u32 flags, addr, netmask, dstaddr, data }` (`(unverified)`) |
-| `IFF_UP` | `0x1` (`net/if.h:93`) | `0x1`; `std.os.linux.IFF.UP` is bit 0 (`linux.zig:8963-8964`) | `0x1` (`(unverified)`) | `0x1` (`(unverified)`) |
-| `IFF_MULTICAST` | `0x8000` (`net/if.h:109`) | `0x1000` (`(unverified)`); **not present in std**: `std.os.linux.IFF` is a `packed struct(u16)` whose named bits stop at `PROMISC` (bit 8) (`linux.zig:8963-8974`), so only `UP` can be asserted against std | `0x8000` (`(unverified)`) | `0x8000` (`(unverified)`) |
+| `struct ifaddrs` | `{ next, name, u32 flags, addr, netmask, dstaddr, data }` (`ifaddrs.h:36-44`) | glibc: `{ next, name, u32 flags, addr, netmask, ifa_ifu (broadaddr/dstaddr union), data }` (`generic-glibc/ifaddrs.h:29-57`; compiled for `x86_64-linux-gnu`, only musl was run); musl: same field order (`musl/include/ifaddrs.h:12-23`), **verified** (M2, static musl binary: `lo` 127.0.0.1/8 + ::1, `eth0` one v4 /24 and one link-local v6 with the right flags and names) | `{ next, name, unsigned int flags, addr, netmask, dstaddr, data }` (`generic-freebsd/ifaddrs.h:31-39`) | `{ next, name, unsigned int flags, addr, netmask, dstaddr, data }` (`generic-openbsd/ifaddrs.h:31-39`) |
+| `IFF_UP` | `0x1` (`net/if.h:93`) | `0x1`; `std.os.linux.IFF.UP` is bit 0 (`linux.zig:8963-8964`) | `0x1` (`generic-freebsd/net/if.h:139`; `IFF_LOOPBACK 0x8` at `:142`) | `0x1` (`generic-openbsd/net/if.h:203`; `IFF_LOOPBACK 0x8` at `:206`) |
+| `IFF_MULTICAST` | `0x8000` (`net/if.h:109`) | `0x1000` (**verified** M2: `/sys/class/net/eth0/flags` = `0x1003`, `lo` = `0x9`); **not present in std**: `std.os.linux.IFF` is a `packed struct(u16)` whose named bits stop at `PROMISC` (bit 8) (`linux.zig:8963-8974`), so only `UP` can be asserted against std | `0x8000` (`generic-freebsd/net/if.h:155`) | `0x8000` (`generic-openbsd/net/if.h:218`) |
 | `sockaddr` family field | `{ u8 len, u8 family }` (BSD `sa_len`) | `{ u16 family }` | `{ u8 len, u8 family }` | `{ u8 len, u8 family }` |
+| Receive control buffer (`socket_opts.control_buffer_size`) | 64 B: pktinfo + TTL = 40 (v4) / 48 (v6) under the 4-byte layout | 64 B: 56 (v4) / 64 (v6) under the 8-byte layout (v6 fits exactly) | **128 B** (deviation from plan 4.5 `[8][64]u8`): the v4 set is `IP_RECVDSTADDR` + `IP_RECVTTL` + `IP_RECVIF` = 24 + 24 + 72 = 120 with the 56-byte `sockaddr_dl`; in 64 B every v4 datagram would be `MSG_CTRUNC` with the `IP_RECVIF` entry cut, and the arrival ifindex would never decode | **128 B**: 24 + 24 + 48 = 96 with the 32-byte `sockaddr_dl`; same reason |
 
 ## Behaviour and coexistence
 
 | Item | macOS (Darwin) | Linux | FreeBSD | OpenBSD |
 |---|---|---|---|---|
-| OS daemon | mDNSResponder, binds 5353 with `SO_REUSEPORT` | avahi-daemon as uid `avahi` (`SO_REUSEADDR` + `SO_REUSEPORT`) or systemd-resolved | none by default | none by default |
-| Coexistence rule | `SO_REUSEPORT` required; `SO_REUSEADDR` alone fails (M0 spike, see below) | `SO_REUSEADDR` required across uids; `SO_REUSEPORT` alone fails cross-uid; set both | set both | set both |
+| OS daemon | mDNSResponder, binds 5353 with `SO_REUSEPORT` | avahi-daemon as uid `avahi` (`SO_REUSEADDR` + `SO_REUSEPORT`) **and** systemd-resolved (`MulticastDNS=` on): on Fedora 44 both hold `0.0.0.0:5353` and `[::]:5353` at once (`ss -ulnp`), so `firstBinder()` is `true` only when both are stopped | none by default | none by default |
+| Coexistence rule | `SO_REUSEPORT` required; `SO_REUSEADDR` alone fails (M0 spike, see below) | `SO_REUSEADDR` required across uids; `SO_REUSEPORT` alone fails cross-uid; set both (M2: bind as a plain user beside root-owned systemd-resolved and uid-`avahi` avahi-daemon succeeded with both set; the single-flag cases were not re-measured on Linux) | set both | set both |
 | Unicast delivery when shared | exactly one socket receives; which one is an OS detail recorded below and never relied on | hash-balanced among same-uid sockets; never relied on | one socket | one socket |
 | Egress interface selection | `IP_PKTINFO` / `IPV6_PKTINFO` cmsg per send | pktinfo cmsg per send | `IPV6_PKTINFO` cmsg; v4 via `IP_MULTICAST_IF` per send | `IPV6_PKTINFO` cmsg; v4 via `IP_MULTICAST_IF` per send |
 | Arrival interface | `IP_PKTINFO` (`ipi_ifindex`) and `IPV6_PKTINFO` (`ipi6_ifindex`) | `IP_PKTINFO`, `IPV6_PKTINFO` | `IP_RECVIF` (`sockaddr_dl.sdl_index`), `IPV6_PKTINFO` | `IP_RECVIF`, `IPV6_PKTINFO` |
 | `std.posix.IP` under dev.1786 | `void`: hard-code, no cross-check | present: comptime assert against `std.os.linux.IP`/`IPV6`/`SO`/`SOL`/`IFF` (`socket_opts.zig`, `comptime` block) | present: the table reads `std.c.IP`/`IPV6`/`SO` and the same `comptime` block pins them to the plan section 9 numbers (`RECVIF 20`, `RECVTTL 65`, `RECVPKTINFO 36`, `PKTINFO 46`, `HOPLIMIT 47`, ...) | present: same, pinned to `RECVIF 30`, `RECVTTL 31`, `RECVPKTINFO 36`, `PKTINFO 46`, `HOPLIMIT 47` |
 | Io backends | Threaded (gate, fds left BLOCKING: `BindOptions.nonblocking = false`, see "Known risks"); Dispatch on the fork (M6, needs `O_NONBLOCK`) | Threaded (gate, blocking fds); Uring on the fork (M6) | Threaded (blocking fds); Kqueue on the fork (M6) | Threaded (blocking fds); Kqueue on the fork (M6) |
 | Local Network privacy | macOS 15+: GUI-launched processes may be blocked silently; Terminal, SSH and root are allowed | n/a | n/a | n/a |
-| Test host | this Mac | Lima `zig-uring` (cross-built `aarch64-linux-musl`) | Lima `kq-freebsd` (M6, best effort) | none |
-| Unverified | `Clock.boot` for the wake heuristic; Evented Io construction API; whether Darwin `udp_input` can ever report a readable socket whose datagram then vanishes (not observed, see "Known risks") | `ifaddrs` layout on musl; `ip_mreqn` layout; the bad-checksum spurious-readiness behaviour of `udp_poll` on a blocking vs `O_NONBLOCK` fd (read from net/ipv4/udp.c, not exercised) | every constant on hardware | every constant on hardware; `ifaddrs` layout; `ip_mreqn` |
+| Test host | this Mac | Lima `zig-uring` (cross-built `aarch64-linux-musl`, run in M2) | Lima `kq-freebsd` (M6, best effort) | none |
+| Unverified | `Clock.boot` for the wake heuristic; Evented Io construction API; whether Darwin `udp_input` can ever report a readable socket whose datagram then vanishes (not observed, see "Known risks") | glibc `ifaddrs` layout (`x86_64-linux-gnu` compiles, only musl ran); `IP_RECVTTL`/`IPV6_HOPLIMIT` cmsg values (delivered, not printed by `mdns-live`); the bad-checksum spurious-readiness behaviour of `udp_poll` on a blocking vs `O_NONBLOCK` fd (read from net/ipv4/udp.c, not exercised) | every constant on hardware (every header cited in the tables above is on disk in the pinned toolchain and matches the code; nothing was run) | every constant on hardware (headers on disk and matching the code; nothing was run) |
 
 ## macOS spike results (M0)
 
@@ -405,3 +415,185 @@ must do the same.
   with `SO_REUSEPORT`, so "the daemon holds the port" is really "several
   processes hold the port", which changes nothing for us because the
   oldest binder (mDNSResponder) still owns unicast delivery.
+
+## Linux runs (M2)
+
+Filled on 2026-09-16 from runs of the cross-built binaries inside the Lima
+VM `zig-uring`. Nothing here is copied from the plan.
+
+Host: Lima VM `zig-uring`, Fedora Linux 44 (Cloud Edition), kernel
+`6.19.10-300.fc44.aarch64`, glibc 2.43 on the system; the binaries are
+`-Dtarget=aarch64-linux-musl` (static musl, `file`: "ELF 64-bit LSB
+executable, ARM aarch64, statically linked"), Debug, built on the Mac with
+`0.17.0-dev.1786+75044cb04` and executed through the `/Users` mount at
+the same absolute path. `avahi-daemon` runs as `uid=70(avahi)` and
+`systemd-resolved` runs as root with mDNS on; `sudo ss -ulnp | grep 5353`
+shows both holding `0.0.0.0:5353` and `[::]:5353`. Interfaces: `lo`
+(index 1, flags `0x9`, 127.0.0.1/8 and `::1`) and `eth0` (index 2, flags
+`0x1003`, one v4 /24 and one link-local v6). `avahi-publish -s m2demo
+_mdnszig._udp 5001 k=v` and `avahi-browse -a -r` ran in the VM during the
+timed runs to provoke traffic (`avahi-browse` listed `m2demo` on `eth0`
+IPv4, `eth0` IPv6 and `lo` IPv4, so avahi itself is active on `lo` for
+v4 only).
+
+### Unit and public-API tests (`just lima-test`)
+
+`zig build test-exe -Dtarget=aarch64-linux-musl` installs
+`zig-out/test/mdns-unit-tests` and `zig-out/test/mdns-api-tests`; both
+ran in the VM:
+
+```
+All 89 tests passed.        # mdns-unit-tests (src/root.zig), exit 0
+All 22 tests passed.        # mdns-api-tests (tests/root.zig), exit 0
+4 fuzz tests found.
+```
+
+The API run includes the real-socket tests (`Service.init binds 5353
+beside the OS daemon`, `mode C serve delivers events into a Mailbox and
+ends on close`, ...) beside avahi and systemd-resolved, and the
+conformance and fixture tests that read `docs/` and `tests/fixtures/`
+through the absolute `build_options.repo_root`. The first run failed
+`Service.init binds 5353 beside the OS daemon` on `tx_dropped == 0` with
+`tx_dropped = 1`: see "Loopback v6" below for the cause and the fix.
+
+### `mdns-live` with avahi and systemd-resolved running
+
+`zig build live -Dtarget=aarch64-linux-musl`, then
+`limactl shell zig-uring -- .../zig-out/bin/mdns-live --seconds 4` (the
+`just lima-live` recipe):
+
+```
+mdns-live os=linux seconds=4 ipv6=true include_loopback=true allow_len=0
+bind result=OK first_binder=false sockets=2
+socket local=0.0.0.0:5353
+socket local=[::]:5353
+iface index=1 name=lo v4_addrs=1 v6_addrs=0 joined_v4=true joined_v6=false v4_dropped=0 v6_dropped=0
+iface index=2 name=eth0 v4_addrs=1 v6_addrs=1 joined_v4=true joined_v6=true v4_dropped=0 v6_dropped=0
+event kind=interfaces_changed
+stats rx=15 tx=6 tx_dropped=0 dropped_malformed=0 dropped_bad_port=0 events_dropped=0 addrs_dropped=0
+rx v4=10 v4_with_ifindex=10 v6=5 v6_with_ifindex=5 tolerated_errors=0 steps=72 step_errors=0
+RESULT bind=OK first_binder=false joined_v4=2 joined_v6=1 rx_v4_ifindex=10 rx_v6_ifindex=5 tx=6
+```
+
+- Bind: both sockets on `*:5353` as an unprivileged user with
+  `SO_REUSEADDR` + `SO_REUSEPORT`, beside a root-owned and a uid-`avahi`
+  holder; `first_binder=false` (the trial bind without reuse flags fails
+  with `EADDRINUSE`).
+- Joins: `IP_ADD_MEMBERSHIP` with `ip_mreqn` (ifindex) on `lo` and
+  `eth0`; `IPV6_ADD_MEMBERSHIP` with `ipv6_mreq` on `eth0`. No
+  `join_failed` warning in any run.
+- pktinfo decode: `IP_PKTINFO` (8) gave a non-zero `ipi_ifindex` on 10/10
+  v4 datagrams and `IPV6_PKTINFO` (50, enabled by `IPV6_RECVPKTINFO` 49)
+  on 5/5 v6 datagrams, through the `@sizeOf(usize)`-aligned cmsg walker.
+  Across all M2 runs in the VM every received datagram carried an ifindex
+  (`rx_v4_ifindex == v4` and `rx_v6_ifindex == v6` on every line).
+- The stub PTR query went out on every joined (interface, family) pair
+  every 2 s (`tx=6` = 3 pairs x 2 rounds); `tx_dropped=0`.
+
+### `first_binder` with the daemons stopped
+
+```
+=== A: stop avahi-daemon only
+avahi=inactive resolved=active
+UNCONN 0 0 0.0.0.0:5353 0.0.0.0:* users:(("systemd-resolve",pid=2074,fd=16))
+UNCONN 0 0    [::]:5353    [::]:* users:(("systemd-resolve",pid=2074,fd=17))
+bind result=OK first_binder=false sockets=2
+RESULT bind=OK first_binder=false joined_v4=2 joined_v6=1 rx_v4_ifindex=4 rx_v6_ifindex=2 tx=6
+=== B: stop systemd-resolved too
+avahi=inactive resolved=inactive
+0                                   # ss -ulnp | grep -c 5353
+bind result=OK first_binder=true sockets=2
+stats rx=6 tx=6 tx_dropped=0 dropped_malformed=0 dropped_bad_port=0 events_dropped=0 addrs_dropped=0
+RESULT bind=OK first_binder=true joined_v4=2 joined_v6=1 rx_v4_ifindex=4 rx_v6_ifindex=2 tx=6
+=== restore
+avahi=active resolved=active        # 4 sockets on 5353 again
+```
+
+The plan's acceptance line stops `avahi-daemon` alone and expects
+`first_binder=true`; on this Fedora image that is not enough because
+`systemd-resolved` also holds `*:5353`. With both stopped the trial bind
+succeeds and `firstBinder()` is `true`; with either running it is
+`false`. Both services were restarted afterwards and are active. In case
+B the counts match our own multicast echoes (loop on): 2 rounds x (`lo`
+v4 + `eth0` v4 + `eth0` v6) = `tx=6` and `rx v4=4 v6=2`, so the joined
+groups deliver with no daemon present.
+
+### `IP_MULTICAST_ALL` and `IPV6_MULTICAST_ALL`
+
+Allow-list runs while `avahi-publish` and `avahi-browse -a -r` kept
+`eth0` busy:
+
+```
+=== lo only (--ifindex 1), before IPV6_MULTICAST_ALL=0
+RESULT bind=OK first_binder=false joined_v4=1 joined_v6=0 rx_v4_ifindex=9 rx_v6_ifindex=6 tx=3
+=== lo only (--ifindex 1), with IPV6_MULTICAST_ALL=0
+RESULT bind=OK first_binder=false joined_v4=1 joined_v6=0 rx_v4_ifindex=9 rx_v6_ifindex=0 tx=2
+=== eth0 only (--ifindex 2)
+RESULT bind=OK first_binder=false joined_v4=1 joined_v6=1 rx_v4_ifindex=6 rx_v6_ifindex=6 tx=4
+=== --no-ipv6 --no-loopback (one socket)
+bind result=OK first_binder=false sockets=1
+RESULT bind=OK first_binder=false joined_v4=1 joined_v6=0 rx_v4_ifindex=1 rx_v6_ifindex=0 tx=1
+```
+
+With only `lo` allowed the v6 socket joined nothing, yet the first run
+received 6 `ff02::fb` datagrams (avahi's traffic on `eth0`, delivered
+because the host is a member there): Linux applies the "receive every
+group any socket joined" default to v6 as well, through
+`IPV6_MULTICAST_ALL` (29, kernel 4.20+), which `std.os.linux.IPV6` does
+not name. `bindMdnsSocket` now sets it to 0 on Linux next to
+`IP_MULTICAST_ALL` (49); the re-run received 0 v6 datagrams, and the
+`eth0` run still received all 6. For v4 the `lo`-only counts cannot
+separate `lo` from `eth0` traffic (avahi is on `lo` too), so a Python
+side-by-side settled it: two wildcard `*:5353` sockets with both reuse
+flags and no joins, 4 s under the same load, `IP_MULTICAST_ALL=0` received
+0 datagrams and the default socket received 4.
+
+### Loopback v6
+
+`lo` reports flags `0x9` (`UP|LOOPBACK`) without `IFF_MULTICAST`.
+`IPV6_ADD_MEMBERSHIP` for `ff02::fb` on `lo` succeeds, but every send to
+`[ff02::fb]:5353` through `lo` fails: `sendmsg` with `IPV6_PKTINFO`
+ifindex 1 or `sin6_scope_id = 1` returns `ENETUNREACH` (Python check in
+the VM; `eth0` succeeds either way). In the first `mdns-live` run this
+showed up as `tx_dropped=2` per 4 s with `include_loopback` on, and as the
+failed `tx_dropped == 0` assertion in the API test. v4 multicast to
+`224.0.0.251` through `lo` works. `ifaces.zig` therefore keeps a loopback
+interface that lacks `IFF_MULTICAST` for v4 only (`v6_addrs=0` for `lo`
+above); Darwin `lo0` carries `IFF_MULTICAST` and keeps both families.
+
+### Cross-compile checks
+
+`zig build -Dtarget=aarch64-freebsd`, `-Dtarget=aarch64-openbsd` and
+`-Dtarget=x86_64-linux-gnu` each produced `zig-out/bin/mdns-live` for
+that target (`file`: FreeBSD 14.0 dynamic, OpenBSD PIE, x86-64 glibc);
+`zig build test-exe` for the same three targets produced both test
+binaries. None of these ran. On this pin `zig build test -Dtarget=...`
+compiles the tests and then fails only with "host system is unable to
+execute binaries from the target".
+
+## macOS runs (M2)
+
+2026-09-16, from a shell under Claude Code (no GUI bundle), with
+`/usr/bin/dns-sd -B _services._dns-sd._udp` running in the background
+(killed afterwards; `pgrep -x dns-sd` empty). mDNSResponder held 5353.
+Local Network privacy did not block anything.
+
+```
+=== mise exec -- zig build live -- --seconds 3
+bind result=OK first_binder=false sockets=2
+iface index=1 name=lo0 v4_addrs=1 v6_addrs=2 joined_v4=true joined_v6=true ...
+iface index=15 name=en0 v4_addrs=1 v6_addrs=2 joined_v4=true joined_v6=true ...
+... 17 interfaces in total (awdl0, llw0, utun0-utun10, bridge100, bridge101 v6-only or both)
+stats rx=96 tx=44 tx_dropped=0 dropped_malformed=0 dropped_bad_port=0 events_dropped=0 addrs_dropped=0
+rx v4=31 v4_with_ifindex=31 v6=65 v6_with_ifindex=65 tolerated_errors=0 steps=46 step_errors=0
+RESULT bind=OK first_binder=false joined_v4=5 joined_v6=17 rx_v4_ifindex=31 rx_v6_ifindex=65 tx=44
+=== mise exec -- zig build live -- --seconds 3 --ifindex 15   (en0)
+iface index=15 name=en0 v4_addrs=1 v6_addrs=2 joined_v4=true joined_v6=true v4_dropped=0 v6_dropped=0
+stats rx=56 tx=4 tx_dropped=0 dropped_malformed=0 dropped_bad_port=0 events_dropped=0 addrs_dropped=0
+rx v4=34 v4_with_ifindex=34 v6=22 v6_with_ifindex=22 tolerated_errors=0 steps=44 step_errors=0
+RESULT bind=OK first_binder=false joined_v4=1 joined_v6=1 rx_v4_ifindex=34 rx_v6_ifindex=22 tx=4
+```
+
+No `join_failed` or `addrs_truncated` warning in either run; the `en0`
+run joined exactly one ifindex per family. The v6 side of the full run
+also joined the `utun` interfaces (link-local only, no v4), as in M0.

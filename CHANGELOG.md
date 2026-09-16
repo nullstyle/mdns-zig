@@ -2,6 +2,89 @@
 
 ## Unreleased
 
+### M2 - sockets, interfaces, Service shell; Linux column filled
+
+- `src/platform/ifaces.zig`: self-declared `getifaddrs`/`freeifaddrs`
+  externs and `struct ifaddrs` layouts for Darwin, Linux (glibc and musl),
+  FreeBSD and OpenBSD; `IFF_UP`/`IFF_LOOPBACK` asserted against
+  `std.os.linux.IFF`, `IFF_MULTICAST` hard-coded (`0x1000` Linux, `0x8000`
+  elsewhere); the pure fold `fromIfaddrs` (up + multicast only, loopback
+  on request, `Service.Options.interfaces` allow-list, netmask to
+  `prefix_len`, v6 global-first link-local-last, 8 addresses per family
+  with the overflow in `v4_dropped`/`v6_dropped`, KAME scope cleared) and
+  `diff()`. The plan's named tests exist under their exact names.
+- `src/core/events.zig`: `Event`, `Warning`, `Interface`, `Family`,
+  `Limits`, `Stats`, `Resolved`, `ServiceDesc` and friends as pointer-free
+  values (checked at comptime), plus the drop-oldest `EventQueue`.
+- `src/core/engine.zig`: the plan section 5 `Engine` surface with M2 stub
+  internals (`setInterfaces`, `handle` with `dropped_malformed` /
+  `dropped_bad_port`, a fixed `_services._dns-sd._udp.local` PTR query
+  every 2 s per interface per family; `advertise`/`updateTxt`/`browse`
+  return `error.NotImplemented` until M3/M4).
+- M2 review fixes: `Service.sendDatagram` / `flushTx` propagate
+  `error.Canceled` instead of counting it as a drop (Threaded cancelation
+  is one-shot, so a `Group.cancel` landing on a send used to be lost and
+  `serve` never returned); `serve` now backs off one step cap after a
+  fatal step error and counts it in `rxCounters().fatal_errors` instead
+  of re-stepping at once; datagrams with `MSG_TRUNC` are counted in
+  `rxCounters().truncated` and never handed to the Engine; the step wait
+  floor and the send timeout are 2 ms (`min_wait_us`), because Threaded
+  truncates a 1 ms timeout to `poll(0)`; `socket_opts.control_buffer_size`
+  is 128 on FreeBSD and OpenBSD (the `IP_RECVIF` + `IP_RECVDSTADDR` +
+  `IP_RECVTTL` v4 set needs 120 / 96 B, a deviation from plan 4.5's
+  `[8][64]u8`; 64 elsewhere); `EventQueue` moved to `core/events.zig`
+  (the unused `EventRing` is gone; the named ring test targets the shipped
+  type); `ifaces.decodeIfaddrs` calls `if_nametoindex` only for inet
+  entries; BSD header citations in `docs/platform-matrix.md` replaced the
+  `(unverified)` tags; `mdns-live` stops after four fatal step errors.
+- `src/service.zig`: `Service` (two blocking sockets on `*:5353`, batch
+  buffers allocated once at `init`, `Timed` helpers with no `.none`
+  member, modes A `tick`, B `step`/`run`, C `serve` over a `Mailbox`,
+  `refreshInterfaces`, `firstBinder`, `sockets`, warnings
+  `v6_unavailable`/`join_failed`/`no_interfaces`/`no_packets_10s`, send
+  failures counted in `stats.tx_dropped`). `mdns.Service`, `mdns.Mailbox`,
+  `mdns.Engine` and `mdns.core` are exported from the module root.
+- `tests/live/main.zig` -> `zig-out/bin/mdns-live` (`zig build live --
+  --seconds N [--ifindex N ...] [--no-ipv6] [--no-loopback]`); plain
+  `zig build [-Dtarget=...]` installs it, which is the compile-only check
+  for the BSD targets. `tests/service_test.zig`: the real-socket public-API
+  tests.
+- `build.zig`: `test-exe` installs both test binaries under `zig-out/test/`
+  without running them so a cross build can be executed elsewhere.
+  `justfile`: `lima-test` (replaces `lima-linux`, which could no longer
+  compile `tests/root.zig` without `build_options`) and `lima-live`.
+- Linux (Lima `zig-uring`, Fedora 44, kernel 6.19.10, static
+  `aarch64-linux-musl`): `mdns-unit-tests` 89/89 and `mdns-api-tests`
+  22/22 pass in the VM; `mdns-live` binds beside avahi-daemon (uid
+  `avahi`) and systemd-resolved with `first_binder=false`, joins `lo` (v4)
+  and `eth0` (both), decodes a pktinfo ifindex on 100% of received
+  datagrams in both families; `first_binder=true` once **both** daemons
+  are stopped (stopping avahi alone is not enough on Fedora, where
+  systemd-resolved also holds `*:5353`). Details, including the
+  `IP_MULTICAST_ALL` measurements, in `docs/platform-matrix.md`, "Linux
+  runs (M2)".
+- macOS: `zig build live -- --seconds 3` beside mDNSResponder with
+  `dns-sd -B` running: `first_binder=false`, 17 interfaces joined, 31/31
+  v4 and 65/65 v6 datagrams with a decoded ifindex; `--ifindex 15` (en0)
+  joins one ifindex per family with no `join_failed`.
+- Fixes from the Linux runs:
+  - `IPV6_MULTICAST_ALL` (29, Linux, absent from `std.os.linux.IPV6`) is
+    set to 0 beside `IP_MULTICAST_ALL`: without it the v6 socket received
+    every `ff02::fb` datagram on interfaces only avahi had joined
+    (measured: 6 datagrams with no v6 join, 0 after the fix).
+  - A loopback interface without `IFF_MULTICAST` (Linux `lo`, flags
+    `0x9`) is kept for v4 only under `include_loopback`: the v6 join
+    succeeds but every send to `ff02::fb` via `lo` fails with
+    `ENETUNREACH`, which showed as `tx_dropped=2` per 4 s and failed the
+    API test's `tx_dropped == 0` assertion in the VM.
+- FreeBSD and OpenBSD: `zig build` and `zig build test-exe` for
+  `aarch64-freebsd` and `aarch64-openbsd` (and `x86_64-linux-gnu`) compile;
+  none ran (documented as "compile-only, reviewed, not run").
+- Known deviations from the plan text: `Service.Options.include_loopback`
+  keeps Linux `lo` although it lacks `IFF_MULTICAST` (v4 only, above);
+  the plan's Linux acceptance line needs systemd-resolved stopped as well
+  as avahi on Fedora.
+
 ### M1 - wire codec, fixtures, fuzz
 
 - `src/wire/*` (`mdns.wire`, with `Bounded`, `Name`, `Txt`, `TxtPair`

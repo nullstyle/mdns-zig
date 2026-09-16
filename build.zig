@@ -81,6 +81,24 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_api_tests.step);
 
+    // Install the two test binaries without running them, at fixed paths
+    // (zig-out/test/mdns-unit-tests, zig-out/test/mdns-api-tests), so a
+    // cross build (`zig build test-exe -Dtarget=aarch64-linux-musl`) can be
+    // executed inside the Lima VM through its /Users mount (`just
+    // lima-test`). The binaries carry the default test runner and print
+    // their summary to stderr when run directly.
+    const test_exe_step = b.step("test-exe", "Install the test binaries under zig-out/test without running them");
+    for ([_]struct { exe: *std.Build.Step.Compile, name: []const u8 }{
+        .{ .exe = unit_tests, .name = "mdns-unit-tests" },
+        .{ .exe = api_tests, .name = "mdns-api-tests" },
+    }) |t| {
+        const install = b.addInstallArtifact(t.exe, .{
+            .dest_dir = .{ .override = .{ .custom = "test" } },
+            .dest_sub_path = t.name,
+        });
+        test_exe_step.dependOn(&install.step);
+    }
+
     // ---- docs -----------------------------------------------------------
     const docs_object = b.addObject(.{
         .name = "mdns-docs",
@@ -128,8 +146,35 @@ pub fn build(b: *std.Build) void {
     _ = b.step("examples", "Build and run the examples (none yet)");
 
     // ---- live -----------------------------------------------------------
-    // Real-socket tests land in M2 (tests/live/). Placeholder step.
-    _ = b.step("live", "Run loopback and live-socket tests (M2)");
+    // Real-socket check: binds *:5353 beside the OS daemon, joins the
+    // groups, runs mode B for a few seconds. Installed as
+    // zig-out/bin/mdns-live so the cross-built binary has a fixed path
+    // (`zig build live -Dtarget=aarch64-linux-musl`, then run it in the
+    // Lima VM). `zig build live -- --seconds 3 --ifindex N` forwards args.
+    const live_exe = b.addExecutable(.{
+        .name = "mdns-live",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/live/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "mdns", .module = mdns }},
+        }),
+    });
+    // `installArtifact` also makes the default `zig build [-Dtarget=..]`
+    // compile and install it, which is the compile-only check for the
+    // BSD targets.
+    b.installArtifact(live_exe);
+    const run_live = b.addRunArtifact(live_exe);
+    run_live.has_side_effects = true;
+    run_live.addPassthruArgs();
+    run_live.step.dependOn(b.getInstallStep());
+    const live_step = b.step("live", "Build zig-out/bin/mdns-live and run it (real sockets on *:5353)");
+    live_step.dependOn(b.getInstallStep());
+    // Cross builds only install: the host cannot run a foreign binary.
+    if (target.result.os.tag == builtin.os.tag and target.result.cpu.arch == builtin.cpu.arch) {
+        live_step.dependOn(&run_live.step);
+    }
 }
 
 /// Absolute path of the directory holding this build.zig. `b.root` is a

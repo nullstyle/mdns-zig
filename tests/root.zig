@@ -8,6 +8,7 @@ comptime {
     _ = @import("codec_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("fixtures/loader.zig");
+    _ = @import("service_test.zig");
 }
 
 test {

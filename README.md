@@ -69,10 +69,13 @@ timings", "Known risks").
 
 ## Platforms and Io backends
 
-macOS and Linux (Threaded backend) are the v0.1 gates; FreeBSD and OpenBSD
-compile with reviewed constants. Socket-option numbers, cmsg layouts,
-coexistence rules with the OS daemon and the measured spike results live
-in [docs/platform-matrix.md](docs/platform-matrix.md).
+macOS and Linux (Threaded backend) are the v0.1 gates: the live check and
+the whole test suite run on this Mac beside mDNSResponder and, cross-built
+for `aarch64-linux-musl`, in a Fedora Lima VM beside avahi-daemon and
+systemd-resolved (M2). FreeBSD and OpenBSD compile with reviewed
+constants and have not been run. Socket-option numbers, cmsg layouts,
+coexistence rules with the OS daemon and the measured results live in
+[docs/platform-matrix.md](docs/platform-matrix.md).
 
 ## Security posture
 
@@ -97,7 +100,8 @@ just fmt-check          # mise fmt --check + zig fmt --check
 just spike-all          # bind5353, join_pktinfo, zero_timeout diagnostics
 just spike bind5353     # one spike; extra args go to the program
 just fixtures 10 "label" # capture LAN packets into a fresh tests/fixtures/capture-* dir
-just lima-linux         # cross-build musl tests, run them in Lima `zig-uring`
+just lima-test          # cross-build musl test binaries, run them in Lima `zig-uring`
+just lima-live -- --seconds 4  # cross-build mdns-live, run it beside avahi in the VM
 just check-fork         # advisory run with ~/.zvm/fork-all/zig
 just release-check      # README tag == build.zig.zon version
 ```

@@ -86,21 +86,32 @@ release-check ref="":
 docs:
     {{zig}} build docs
 
-# The test binaries are emitted with --test-no-exec and executed by
-# `limactl shell`, which sees the same absolute path via the /Users mount.
-# Cross-build the tests for Linux (musl) and run them inside the Lima VM.
-lima-linux optimize="Debug":
+# `zig build test-exe` installs both test binaries under zig-out/test
+# without running them; `limactl shell` sees the same absolute path via
+# the /Users mount. The API tests read docs/ and tests/fixtures/ through
+# build_options.repo_root, which is absolute, so they also work there.
+# Cross-build the unit and public-API tests for Linux (musl) and run them inside the Lima VM.
+lima-test optimize="Debug":
     #!/usr/bin/env bash
     set -euo pipefail
-    out="$PWD/zig-out/lima-{{linux_target}}"
-    mkdir -p "$out"
-    {{zig}} test src/root.zig -lc -target {{linux_target}} -O {{optimize}} \
-        --test-no-exec -femit-bin="$out/mdns-unit-tests"
-    {{zig}} test -lc -target {{linux_target}} -O {{optimize}} \
-        --dep mdns -Mroot=tests/root.zig -Mmdns=src/root.zig \
-        --test-no-exec -femit-bin="$out/mdns-api-tests"
-    limactl shell {{lima_vm}} -- "$out/mdns-unit-tests"
-    limactl shell {{lima_vm}} -- "$out/mdns-api-tests"
+    {{zig}} build test-exe -Dtarget={{linux_target}} -Doptimize={{optimize}}
+    limactl shell {{lima_vm}} -- "$PWD/zig-out/test/mdns-unit-tests"
+    limactl shell {{lima_vm}} -- "$PWD/zig-out/test/mdns-api-tests"
+
+# avahi-daemon (and, on Fedora, systemd-resolved) hold *:5353 in the VM,
+# so the expected line is `first_binder=false`; stop both services in the
+# VM to see `first_binder=true`. Extra args go to mdns-live
+# (`--seconds N`, `--ifindex N`, `--no-ipv6`, `--no-loopback`).
+# Cross-build zig-out/bin/mdns-live for Linux (musl) and run it inside the Lima VM.
+lima-live *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{zig}} build live -Dtarget={{linux_target}}
+    # `just lima-live -- --seconds 4`: just needs the `--` before flags
+    # and passes it through, so drop it here.
+    args=({{args}})
+    if [ "${args[0]:-}" = "--" ]; then args=("${args[@]:1}"); fi
+    limactl shell {{lima_vm}} -- "$PWD/zig-out/bin/mdns-live" "${args[@]}"
 
 # Each packet lands as <seq>.hex plus a .json sidecar; the sequence
 # restarts at 0001 every run, so the target directory must be empty (the
