@@ -28,7 +28,7 @@ test-safe:
 # Formatting gate, identical to the CI quality lane.
 fmt-check:
     mise fmt --check
-    {{zig}} fmt --check build.zig src tests spikes
+    {{zig}} fmt --check build.zig src tests spikes examples
 
 # `N` is a run count PER FUZZ TARGET with an optional K/M/G suffix
 # (`--fuzz=N`; there is no time flag; the report prints the first target's
@@ -57,6 +57,27 @@ conformance:
 # Loopback and live-socket tests (real sockets on shared 5353).
 live:
     {{zig}} build live
+
+# Continuous browse until Ctrl-C, e.g. `just example-browse _qmsg._udp`;
+# register something beside it with `dns-sd -R demo _qmsg._udp . 4433 spki=00`.
+# Browse a service type with zig-out/bin/mdns-browse (real sockets on shared 5353).
+example-browse *args:
+    {{zig}} build example-browse -- {{args}}
+
+# Build and install every example under zig-out/bin without running them.
+examples:
+    {{zig}} build examples
+
+# avahi-daemon answers inside the VM; `avahi-publish -s demo2 _qmsg._udp 5001`
+# there makes a found/resolved pair appear. Extra args go to mdns-browse.
+# Cross-build zig-out/bin/mdns-browse for Linux (musl) and run it inside the Lima VM for 10 s.
+lima-browse *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{zig}} build examples -Dtarget={{linux_target}}
+    args=({{args}})
+    if [ "${args[0]:-}" = "--" ]; then args=("${args[@]:1}"); fi
+    limactl shell {{lima_vm}} -- timeout -s INT 10 "$PWD/zig-out/bin/mdns-browse" "${args[@]}"
 
 # Run every diagnostic spike (bind5353, join_pktinfo, zero_timeout).
 spike-all:

@@ -1,15 +1,20 @@
-//! mdns-live: the M2 real-socket check (`zig build live -- [flags]`).
+//! mdns-live: the real-socket check (`zig build live -- [flags]`).
 //!
 //! Binds `*:5353` beside whatever OS daemon is present, joins both groups
-//! on every interface (or only the `--ifindex` allow-list), runs the
-//! Service in mode B (`step`) for `--seconds` and reports what it saw.
+//! on every interface (or only the `--ifindex` allow-list), browses
+//! `--browse <type>` (default `_qmsg._udp`; the `_services._dns-sd._udp`
+//! meta-query is an M6 item and is rejected by the RFC 6335 validator),
+//! runs the Service in mode B (`step`) for `--seconds` and reports what
+//! it saw: every `found`, `resolved` and `lost` event, then the counters.
+//! Run `dns-sd -R demo _qmsg._udp . 4433 k=v` beside it to see a
+//! `found` and a `resolved` line.
 //! Packet counts are informational: on macOS 15+ a GUI-launched process
 //! may be blocked by Local Network privacy and receive nothing while
 //! being entirely correct; the bind, the join list and `firstBinder()`
 //! are the assertions.
 //!
 //! Flags: `--seconds N` (default 4), `--ifindex N` (repeatable; becomes
-//! the allow-list), `--no-ipv6`, `--no-loopback`.
+//! the allow-list), `--browse TYPE`, `--no-ipv6`, `--no-loopback`.
 //!
 //! Last line: `RESULT bind=OK first_binder=<bool> joined_v4=<n>
 //! joined_v6=<n> rx_v4_ifindex=<n> rx_v6_ifindex=<n> tx=<n>`; exit 0
@@ -27,6 +32,7 @@ const Options = struct {
     ipv6: bool = true,
     include_loopback: bool = true,
     allow: std.ArrayList(u32) = .empty,
+    browse: []const u8 = "_qmsg._udp",
 };
 
 fn parseArgs(init: std.process.Init) !Options {
@@ -41,6 +47,8 @@ fn parseArgs(init: std.process.Init) !Options {
         } else if (std.mem.eql(u8, arg, "--ifindex")) {
             const v = it.next() orelse return error.MissingValue;
             try opts.allow.append(arena, try std.fmt.parseInt(u32, v, 10));
+        } else if (std.mem.eql(u8, arg, "--browse")) {
+            opts.browse = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--no-ipv6")) {
             opts.ipv6 = false;
         } else if (std.mem.eql(u8, arg, "--no-loopback")) {
@@ -69,6 +77,16 @@ fn drainEvents(svc: *mdns.Service, out: *Io.Writer) !void {
         for (evs[0..n]) |ev| switch (ev) {
             .warning => |w| try printWarning(out, w),
             .interfaces_changed => try out.print("event kind=interfaces_changed\n", .{}),
+            .found => |f| try out.print("event kind=found instance={f} ifindex={d}\n", .{ f.instance, f.ifindex }),
+            .lost => |l| try out.print("event kind=lost instance={f} ifindex={d}\n", .{ l.instance, l.ifindex }),
+            .resolved => |r| {
+                try out.print("event kind=resolved instance={f} host={f} port={d} ttl_s={d} ifindex={d} addrs=", .{ r.instance, r.host, r.port, r.ttl_s, r.ifindex });
+                for (r.addrs.slice(), 0..) |a, i| {
+                    if (i != 0) try out.writeByte(',');
+                    try out.print("{f}", .{a});
+                }
+                try out.print(" txt_len={d}\n", .{r.txt.slice().len});
+            },
             else => try out.print("event kind={t}\n", .{ev}),
         };
     }
@@ -110,6 +128,12 @@ pub fn main(init: std.process.Init) !u8 {
         });
     }
     try drainEvents(&svc, out);
+    const browse_id = svc.browse(opts.browse) catch |err| {
+        try out.print("browse type={s} err={t}\n", .{ opts.browse, err });
+        try out.print("RESULT bind=OK browse=FAILED err={t}\n", .{err});
+        return 1;
+    };
+    try out.print("browse type={s} id={d}\n", .{ opts.browse, @backingInt(browse_id) });
     try out.flush();
 
     // Mode B for `seconds`, 250 ms cap per step.
@@ -131,8 +155,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     const st = svc.stats();
     const rx = svc.rxCounters();
-    try out.print("stats rx={d} tx={d} tx_dropped={d} dropped_malformed={d} dropped_bad_port={d} events_dropped={d} addrs_dropped={d}\n", .{
-        st.rx, st.tx, st.tx_dropped, st.dropped_malformed, st.dropped_bad_port, st.events_dropped, st.addrs_dropped,
+    try out.print("stats rx={d} rx_echo={d} tx={d} tx_dropped={d} dropped_malformed={d} dropped_bad_port={d} dropped_off_link={d} dropped_unicast_unexpected={d} dropped_ignored={d} events_dropped={d} addrs_dropped={d} evictions={d}\n", .{
+        st.rx,               st.rx_echo,          st.tx,                         st.tx_dropped,      st.dropped_malformed,
+        st.dropped_bad_port, st.dropped_off_link, st.dropped_unicast_unexpected, st.dropped_ignored, st.events_dropped,
+        st.addrs_dropped,    st.evictions,
     });
     try out.print("rx v4={d} v4_with_ifindex={d} v6={d} v6_with_ifindex={d} tolerated_errors={d} steps={d} step_errors={d}\n", .{
         rx.v4, rx.v4_with_ifindex, rx.v6, rx.v6_with_ifindex, rx.tolerated_errors, steps, step_errors,

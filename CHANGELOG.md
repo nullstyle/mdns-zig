@@ -2,6 +2,85 @@
 
 ## Unreleased
 
+### M3 - querier, cache, resolve join; Engine internals replace the stub
+
+- `src/core/querier.zig`: browses with the RFC 6762 section 5.2 ladder
+  (first query 20-120 ms, then 1 s doubling to 60 min, +0-2 % jitter),
+  QM-only questions (section 5.4), every due question merged into one
+  packet per joined (interface, family) pair (section 5.3) with the
+  known-answer list (section 7.1, half-TTL rule) continued over further
+  packets with TC (section 7.2); requery marks at 80/85/90/95 % (+0-2 %)
+  only for records a browse cares about; order-independent harvesting of
+  answers and additionals into the `(name, type, class)` cache; `found`
+  / `lost` only for browsed types (a foreign PTR is cached silently and a
+  later browse starts warm); the `resolved` re-emit rule (again on SRV,
+  TXT or address-set change, never on a same-data refresh, `ttl_s` = the
+  shortest RR TTL); follow-up SRV/TXT/A/AAAA questions on their own
+  ladder; link-local AAAA carries the arrival ifindex; `stopBrowse` keeps
+  the cache.
+- `src/core/engine.zig`: real internals behind the section 5 surface:
+  own-echo ring AND source-address test (bridged echoes recorded for the
+  M4 hook), `dropped_ignored` for OPCODE/RCODE != 0, source-port rule,
+  section 11 on-link check for unicast destinations, the 2 s QU window
+  (`dropped_unicast_unexpected`), joined (ifindex, family) pairs with
+  `setJoined` (Revision 5 item 1; `Service` syncs them after every
+  snapshot), `error.DuplicateBrowse`. `Stats` gains `rx_echo`,
+  `rx_echo_bridged`, `dropped_ignored`, `dropped_unicast_unexpected`.
+  `advertise` / `updateTxt` stay `error.NotImplemented` until M4.
+- `src/core/cache.zig`, `timers.zig`, `echo_ring.zig` (foundation; see
+  their module docs), `tests/harness/{scenario,fake_lan,packets}.zig`,
+  `tests/{querier_test,dnssd_test}.zig` with every plan M3 named test,
+  `fuzz Engine.handle never panics`, and a FailingAllocator sweep.
+- `mdns-live` browses `--browse <type>` (default `_qmsg._udp`) and prints
+  `found` / `resolved` / `lost`; verified against `dns-sd -R` on macOS.
+- `examples/browse.zig` (`zig build example-browse -- <type>`, installed
+  as `zig-out/bin/mdns-browse`): continuous browse in mode B
+  (`Service.run` with a SIGINT-flipped shutdown atomic) printing `found`
+  / `resolved` (host, port, addresses, TXT, `ttl_s`) / `lost` lines;
+  `--once` prints "not yet" until M5. Verified against `dns-sd -R` on
+  macOS (found, resolved port 4433, lost after the goodbye) and, cross
+  built for `aarch64-linux-musl`, against `avahi-publish` in the Lima VM.
+  `zig build examples` installs every example; `just example-browse`,
+  `just examples`, `just lima-browse`.
+- M3 review fixes. Querier: requery marks (RFC 6762 section 5.2) and
+  eviction pins are derived from the resolve join, so they no longer
+  depend on record order (SRV/TXT/A before the PTR, or the host's A a
+  packet before the SRV, were never re-queried and silently expired);
+  only the records the join consumes are pinned (one SRV and TXT per
+  instance, 8 + 8 addresses per host), so junk SRV/A records for a found
+  instance cannot fill the pool with protected entries; the ladder
+  stores the jittered gap so consecutive gaps keep the factor of two;
+  a question that does not fit one tick's batch retries at the next
+  tick; a goodbye for an instance's PTR/SRV/TXT stops its follow-up
+  ladder; `resolved.addrs` holds 8 A + 8 AAAA (`max_resolved_addrs`);
+  instances are indexed by SRV-target hash and by PTR slot, so A/AAAA
+  harvesting and pin checks never walk the instance table. Cache:
+  `Flags.pinned` replaces the per-candidate `Pinned` predicate (one
+  pass per eviction; a full pool of descending TTLs went from 2.9 s to
+  ~3 ms per 9000 B packet), a pool with every entry pinned evicts the
+  soonest-expiring pinned entry and reports it through `EvictHook`
+  instead of rejecting the newcomer, bucket indexes are keyed with a
+  per-cache secret seed (`Cache.init(gpa, n, seed)`), section 10.2 keeps
+  a record that is exactly one second old ("more than one second ago"),
+  and the RFC arithmetic lives once in `timers.zig` (`requeryMarkUs`,
+  `expiryUs`, `kaOmit`, now saturating). Engine: `RxMeta.dst_known`
+  (a datagram without a destination cmsg is on-link checked but not
+  dropped by the QU-window rule), `Stats` gains `rx_dst_unknown`,
+  `evictions_pinned`, `cache_rejected`, `instances_dropped`,
+  `questions_deferred`; `rx` is documented as including echoes.
+  Service: `no_packets_10s` ignores own echoes; `browse` before the
+  first `step` (and in modes B/C) is stamped with `nowUs()`;
+  `RxCounters.no_dst`; the joined-pair sync has a test. `timers.zig`
+  documents why the M3 querier memoises scans instead of using
+  `DeadlineSet` (reserved for M4).
+- `tests/harness/fake_responder.zig`: a scripted DNS-SD responder (static
+  instance table, PTR / SRV / TXT / A / AAAA answers via `wire.Builder`,
+  knobs for record order, additionals, cache-flush, TTLs, TC, source
+  port, unicast replies, known-answer suppression, goodbye) that sits on
+  a `FakeLan` segment; seven LAN-level tests in `dnssd_test.zig` drive a
+  browse end to end through it (resolve, KA suppression, requery
+  refresh, bad source port, unicast reply, goodbye, two queriers).
+
 ### M2 - sockets, interfaces, Service shell; Linux column filled
 
 - `src/platform/ifaces.zig`: self-declared `getifaddrs`/`freeifaddrs`

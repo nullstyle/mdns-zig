@@ -1,5 +1,6 @@
 //! Fuzz targets over the wire codec (plan §7 M1, §8 tier 3): `Message.parse`,
-//! `Name.decode`, `Txt.iterate` and a `Builder` round trip. Each is a
+//! `Name.decode`, `Txt.iterate`, a `Builder` round trip and, since M3,
+//! `Engine.handle` with random bytes and `RxMeta`. Each is a
 //! `std.testing.fuzz` target written against the Smith API of this pin
 //! (`std/testing.zig` `pub inline fn fuzz`, `std/testing/Smith.zig`):
 //! `testOne(context, smith: *std.testing.Smith)` pulls bytes with
@@ -762,6 +763,75 @@ fn fuzzBuilderRoundTrip(_: void, smith: *Smith) anyerror!void {
 
 // The fixture seeds must replay as well-formed packets, or the fuzzer
 // starts from inputs that die at the header and the seeds are worthless.
+// ---------------------------------------------------------------------------
+// Engine.handle
+// ---------------------------------------------------------------------------
+
+// Engine target (plan section 8 tier 3, M3): random datagrams with a
+// random `RxMeta` and monotonic clock steps into a browsing Engine.
+// Invariants: no panic, no leak (`std.testing.allocator`), the cache
+// never exceeds its cap, `nextDeadline` after a tick is never in the
+// past, `handle` never allocates (the FailingAllocator sweep in
+// `tests/querier_test.zig` proves that part).
+test "fuzz Engine.handle never panics" {
+    try std.testing.fuzz({}, fuzzEngineHandle, .{
+        .corpus = message_corpus,
+    });
+}
+
+fn fuzzEngineHandle(_: void, smith: *Smith) anyerror!void {
+    var prng = std.Random.DefaultPrng.init(smith.valueRangeAtMost(u64, 0, std.math.maxInt(u64)));
+    var e = try mdns.Engine.init(std.testing.allocator, .{
+        .host_label = "fuzz",
+        .random = prng.random(),
+        .limits = .{ .max_cache_records = 16, .max_events = 8, .max_interfaces = 2, .max_browses = 2 },
+    });
+    defer e.deinit();
+    var iface: mdns.Interface = .{ .index = 3 };
+    try iface.v4.append(.{ .addr = .{ 10, 0, 3, 1 }, .prefix_len = 24 });
+    var ll: [16]u8 = @splat(0);
+    ll[0] = 0xfe;
+    ll[1] = 0x80;
+    ll[15] = 1;
+    try iface.v6.append(.{ .addr = ll, .prefix_len = 64 });
+    try e.setInterfaces(&.{iface}, 0);
+    _ = try e.browse("_qmsg._udp", 0);
+
+    var now: u64 = 0;
+    var buf: [parse_buf_len]u8 = undefined;
+    var out: [wire.max_message_len]u8 = undefined;
+    var rounds: usize = 0;
+    while (rounds < 8) : (rounds += 1) {
+        const len = smith.slice(&buf);
+        const meta: mdns.Engine.RxMeta = .{
+            .from = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+                0 => .{ .ip4 = .{ .bytes = .{ 10, 0, 3, smith.valueRangeAtMost(u8, 0, 255) }, .port = 5353 } },
+                1 => .{ .ip4 = .{ .bytes = .{ 10, 0, 3, 1 }, .port = 5353 } }, // our own address
+                2 => .{ .ip4 = .{ .bytes = .{ 172, 16, 0, 9 }, .port = smith.valueRangeAtMost(u16, 1, 65535) } },
+                else => .{ .ip6 = .{ .bytes = ll, .port = 5353, .interface = .{ .index = 3 } } },
+            },
+            .ifindex = smith.valueRangeAtMost(u32, 0, 4),
+            .dst_multicast = smith.valueRangeAtMost(u8, 0, 1) == 1,
+        };
+        e.handle(buf[0..len], meta, now);
+        try std.testing.expect(e.cacheCount() <= 16);
+        now += smith.valueRangeAtMost(u64, 0, 200 * std.time.us_per_s);
+        e.tick(now);
+        if (e.nextDeadline(now)) |d| try std.testing.expect(d >= now);
+        while (e.pollDatagram(&out, now)) |d| {
+            try std.testing.expect(d.len <= out.len);
+            const msg = try Message.parse(out[0..d.len]);
+            try std.testing.expect(!msg.isResponse());
+            // Our own query comes back as an echo and is dropped.
+            const before = e.stats().rx_echo;
+            e.handle(out[0..d.len], .{ .from = .{ .ip4 = .{ .bytes = .{ 10, 0, 3, 1 }, .port = 5353 } }, .ifindex = 3, .dst_multicast = true }, now);
+            try std.testing.expectEqual(before + 1, e.stats().rx_echo);
+        }
+        while (e.pollEvent()) |_| {}
+    }
+    try std.testing.expectEqual(@as(u64, 0), e.stats().tx_dropped);
+}
+
 test "fuzz corpus seeds replay through Smith as intended" {
     const fixture_seed_count = 7;
     for (message_corpus[0..fixture_seed_count]) |seed| {

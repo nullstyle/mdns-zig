@@ -9,6 +9,13 @@ comptime {
     _ = @import("fuzz_test.zig");
     _ = @import("fixtures/loader.zig");
     _ = @import("service_test.zig");
+    _ = @import("harness_test.zig");
+    _ = @import("querier_test.zig");
+    _ = @import("dnssd_test.zig");
+    _ = @import("harness/scenario.zig");
+    _ = @import("harness/fake_lan.zig");
+    _ = @import("harness/packets.zig");
+    _ = @import("harness/fake_responder.zig");
 }
 
 test {

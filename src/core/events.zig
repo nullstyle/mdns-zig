@@ -89,8 +89,14 @@ pub fn prefixEql(a: []const u8, b: []const u8, prefix_len: u8) bool {
 }
 
 /// Maximum kept addresses per family per interface (plan section 4.8,
-/// "Address overflow per interface").
+/// "Address overflow per interface"). The same cap bounds each family in
+/// a `resolved` value.
 pub const max_addrs_per_family = 8;
+
+/// Capacity of `Resolved.addrs`: at most `max_addrs_per_family` A and
+/// as many AAAA addresses, so a host with many v4 addresses (or v4 junk
+/// injected for it) can never crowd out its v6 addresses.
+pub const max_resolved_addrs = 2 * max_addrs_per_family;
 
 /// `IFNAMSIZ - 1`: the longest interface name without its terminator.
 pub const max_iface_name_len = 15;
@@ -199,8 +205,9 @@ pub const Resolved = struct {
     service_type: Name,
     host: Name,
     port: u16,
-    /// `fe80::` entries carry `.ip6.interface = arrival ifindex`.
-    addrs: Bounded(Io.net.IpAddress, max_addrs_per_family) = .{},
+    /// Every live A (at most 8) then AAAA (at most 8) of `host`. `fe80::`
+    /// entries carry `.ip6.interface = arrival ifindex`.
+    addrs: Bounded(Io.net.IpAddress, max_resolved_addrs) = .{},
     txt: Txt = .{},
     ifindex: u32,
     /// Shortest remaining TTL among the SRV, TXT, A and AAAA records that
@@ -269,6 +276,8 @@ pub const Limits = struct {
 
 /// Counters (plan section 5). Every field is monotonic since `init`.
 pub const Stats = struct {
+    /// Datagrams handed to `Engine.handle`, own echoes included (see
+    /// `rx_echo`; `rx - rx_echo` is what other hosts sent us).
     rx: u64 = 0,
     tx: u64 = 0,
     tx_dropped: u64 = 0,
@@ -283,6 +292,34 @@ pub const Stats = struct {
     /// `Interface.v4_dropped + v6_dropped` (8 cap in `ifaces.zig`) plus
     /// `max_addrs_per_iface` drops, summed by `setInterfaces`.
     addrs_dropped: u64 = 0,
+    /// Our own datagrams looped back (digest in the echo ring AND source
+    /// address ours; plan section 4.8). Not processed further.
+    rx_echo: u64 = 0,
+    /// Own echoes that arrived on an interface other than the one whose
+    /// address they carry (plan section 4.8 "Bridged echo").
+    rx_echo_bridged: u64 = 0,
+    /// Well-formed packets ignored for OPCODE != 0 or RCODE != 0 (RFC
+    /// 6762 sections 18.3, 18.11).
+    dropped_ignored: u64 = 0,
+    /// Unicast-destination responses outside the 2 s window after our
+    /// own QU query (plan section 4.8 "Port sharing").
+    dropped_unicast_unexpected: u64 = 0,
+    /// Datagrams whose destination address the platform did not report
+    /// (no pktinfo / recvdstaddr cmsg): the section 11 on-link check still
+    /// applies, the QU-window drop does not (`RxMeta.dst_known`).
+    rx_dst_unknown: u64 = 0,
+    /// Cache evictions that had to take a record an active browse
+    /// consumes because every cached record was one (plan section 4.5).
+    evictions_pinned: u64 = 0,
+    /// Records the cache refused: non-TXT rdata over 400 B, a TXT with a
+    /// bad length prefix, or (defensively) a full pool with no victim.
+    cache_rejected: u64 = 0,
+    /// `found` instances with no free resolve slot: no `resolved`, no
+    /// follow-up questions for them until a slot frees.
+    instances_dropped: u64 = 0,
+    /// Due questions that did not fit one tick's batch (256) and retried
+    /// at the next tick.
+    questions_deferred: u64 = 0,
 };
 
 // ---- pointer-free check ----------------------------------------------

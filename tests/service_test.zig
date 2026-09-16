@@ -51,14 +51,24 @@ test "Service.init binds 5353 beside the OS daemon" {
     }
     try testing.expect(saw_changed);
 
-    // Mode B: a bounded step never fails on an idle socket and sends the
-    // stub query on every joined interface.
+    // Mode B: a bounded step never fails on an idle socket. Nothing is
+    // sent without a browse; with one, the first query (20-120 ms after
+    // `browse`) goes out on every joined pair within a few steps.
     try svc.step(.fromMilliseconds(20));
+    try testing.expectEqual(@as(u64, 0), svc.stats().tx);
+    // No query is scheduled without a browse. A record from real LAN
+    // traffic may already sit in the cache (foreign types are cached
+    // silently), whose expiry deadline is at least the 1 s goodbye grace
+    // away; a browse deadline is at most 120 ms away.
+    if (svc.nextDeadline(svc.nowUs())) |d| try testing.expect(d >= svc.nowUs() + std.time.us_per_s);
+    _ = try svc.browse("_mdns-zig-test._udp");
+    const first = svc.nextDeadline(svc.nowUs()).?;
+    try testing.expect(first <= svc.nowUs() + 120 * std.time.us_per_ms);
+    var i: usize = 0;
+    while (i < 8 and svc.stats().tx == 0) : (i += 1) try svc.step(.fromMilliseconds(50));
     const st = svc.stats();
     try testing.expect(st.tx >= 1);
     try testing.expectEqual(@as(u64, 0), st.tx_dropped);
-    // `nextDeadline` follows the Engine's 2 s stub cadence.
-    try testing.expect(svc.nextDeadline(svc.nowUs()) != null);
 }
 
 test "allow-list with zero joined interfaces emits no_interfaces and init succeeds" {
@@ -94,25 +104,36 @@ test "allow-list with zero joined interfaces emits no_interfaces and init succee
     try testing.expectEqual(@as(u64, 0), svc.stats().tx);
 }
 
-test "mode A tick follows the embedder clock and the stub cadence" {
+test "mode A tick follows the embedder clock and the query ladder" {
     var svc = initOrSkip(.{ .host_label = "api", .include_loopback = true, .rx_poll_interval_us = 5_000 }) catch |err| switch (err) {
         error.NoMulticastInterface => return error.SkipZigTest,
         else => return err,
     };
     defer svc.deinit();
-    // The first tick drains (nothing drained yet), ticks the stub (query
-    // due at once) and sends.
+    // No browse: a tick sends nothing.
     try svc.tick(1_000);
+    try testing.expectEqual(@as(u64, 0), svc.stats().tx);
+    // A browse schedules its first query 20-120 ms after the last tick.
+    _ = try svc.browse("_mdns-zig-test._udp");
+    const first = svc.nextDeadline(1_000).?;
+    try testing.expect(first >= 1_000 + 20_000 and first <= 1_000 + 120_000);
+    try svc.tick(first - 1);
+    try testing.expectEqual(@as(u64, 0), svc.stats().tx);
+    try svc.tick(first);
     try testing.expect(svc.stats().tx >= 1);
     const tx_after_first = svc.stats().tx;
-    // Inside the 2 s stub interval no new query goes out.
-    try svc.tick(2_000);
-    try svc.tick(1_000_000);
+    // The second query is due 1 s (+0-2 %) later; not before.
+    const second = svc.nextDeadline(first).?;
+    try testing.expect(second >= first + 1_000_000 and second <= first + 1_020_000);
+    try svc.tick(first + 900_000);
     try testing.expectEqual(tx_after_first, svc.stats().tx);
-    // At the 2 s mark the next round goes out.
-    try svc.tick(1_000 + mdns.Engine.stub_query_interval_us);
+    try svc.tick(second);
     try testing.expect(svc.stats().tx > tx_after_first);
-    try testing.expectEqual(@as(?u64, 1_000 + 2 * mdns.Engine.stub_query_interval_us), svc.nextDeadline(1_000 + mdns.Engine.stub_query_interval_us));
+    // Then at least twice the previous gap (+0-2 %): RFC 6762 section
+    // 5.2 "MUST increase by at least a factor of two".
+    const third = svc.nextDeadline(second).?;
+    const gap1 = second - first;
+    try testing.expect(third - second >= 2 * gap1 and third - second <= 2 * gap1 + 2 * gap1 / 50);
 }
 
 test "mode C serve delivers events into a Mailbox and ends on close" {
@@ -123,6 +144,8 @@ test "mode C serve delivers events into a Mailbox and ends on close" {
     defer svc.deinit();
     const io = testing.io;
 
+    // A browse so serve has something to send.
+    _ = try svc.browse("_mdns-zig-test._udp");
     var mbuf: [16]Event = undefined;
     var mailbox: mdns.Mailbox = .init(&mbuf);
     var group: Io.Group = .init;
@@ -137,7 +160,9 @@ test "mode C serve delivers events into a Mailbox and ends on close" {
         if (ev == .interfaces_changed) saw_changed = true;
     }
     try testing.expect(saw_changed);
-    // Closing the mailbox ends serve within one step cap.
+    // Let the browse's first query (due within 120 ms) go out, then
+    // close: serve ends within one step cap.
+    try (Io.Clock.Duration{ .raw = .fromMilliseconds(300), .clock = .awake }).sleep(io);
     mailbox.close(io);
     try group.await(io);
     try testing.expect(svc.stats().tx >= 1);
@@ -153,14 +178,19 @@ test "Engine surface is reachable from the module root" {
     try iface.v4.append(.{ .addr = .{ 127, 0, 0, 1 }, .prefix_len = 8 });
     try e.setInterfaces(&.{iface}, 0);
     try testing.expectEqual(Event.interfaces_changed, e.pollEvent().?);
-    e.tick(0);
+    const id = try e.browse("_mdns-zig-test._udp", 0);
+    const due = e.nextDeadline(0).?;
+    e.tick(due);
     var buf: [1500]u8 = undefined;
-    const d = e.pollDatagram(&buf, 0).?;
+    const d = e.pollDatagram(&buf, due).?;
     try testing.expectEqual(@as(u32, 1), d.ifindex);
     try testing.expectEqual(@as(u16, 5353), d.to.ip4.port);
     const msg = try mdns.wire.Message.parse(buf[0..d.len]);
     try testing.expectEqual(@as(u16, 1), msg.header.qdcount);
-    e.handle(buf[0..d.len], .{ .from = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 5353 } }, .ifindex = 1, .dst_multicast = true }, 1);
+    e.handle(buf[0..d.len], .{ .from = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 5353 } }, .ifindex = 1, .dst_multicast = true }, due + 1);
     try testing.expectEqual(@as(u64, 1), e.stats().rx);
+    try testing.expectEqual(@as(u64, 1), e.stats().rx_echo);
     try testing.expectEqual(@as(u64, 1), e.stats().tx);
+    e.stopBrowse(id, due + 1);
+    try testing.expectEqual(null, e.nextDeadline(due + 1));
 }

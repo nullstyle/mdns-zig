@@ -141,9 +141,38 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---- examples -------------------------------------------------------
-    // No examples yet (M4). The step exists so `zig build examples` is
-    // valid from M0 on.
-    _ = b.step("examples", "Build and run the examples (none yet)");
+    // Each example installs as zig-out/bin/mdns-<name> (so a cross build
+    // has a fixed path for the Lima VM) and gets a run step
+    // `example-<name>` that forwards `-- args`. `zig build examples`
+    // installs them all without running anything.
+    const examples_step = b.step("examples", "Build and install every example under zig-out/bin");
+    const examples = [_]struct { name: []const u8, file: []const u8, desc: []const u8 }{
+        .{ .name = "browse", .file = "examples/browse.zig", .desc = "Browse a service type continuously (mdns-browse [<type>] ...)" },
+    };
+    for (examples) |ex| {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("mdns-{s}", .{ex.name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(ex.file),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{.{ .name = "mdns", .module = mdns }},
+            }),
+        });
+        const install = b.addInstallArtifact(exe, .{});
+        examples_step.dependOn(&install.step);
+        const run = b.addRunArtifact(exe);
+        run.has_side_effects = true;
+        run.addPassthruArgs();
+        run.step.dependOn(&install.step);
+        const step = b.step(b.fmt("example-{s}", .{ex.name}), ex.desc);
+        step.dependOn(&install.step);
+        // Cross builds only install: the host cannot run a foreign binary.
+        if (target.result.os.tag == builtin.os.tag and target.result.cpu.arch == builtin.cpu.arch) {
+            step.dependOn(&run.step);
+        }
+    }
 
     // ---- live -----------------------------------------------------------
     // Real-socket check: binds *:5353 beside the OS daemon, joins the

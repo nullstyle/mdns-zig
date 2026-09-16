@@ -28,10 +28,13 @@
 //!   allow-list zero joined interfaces is `warning.no_interfaces`, not an
 //!   error. Send failures are counted in `stats.tx_dropped`.
 //!
-//! M2 scope: `advertise`, `updateTxt`, `browse` and `lookup` forward to
-//! the Engine stub and return `error.NotImplemented` until M3/M4;
-//! `deinit` leaves the groups and closes the sockets (the bounded goodbye
-//! flush is M4). Everything else is the final shape.
+//! Scope after M3: `browse`, `stopBrowse` and `lookup` drive the real
+//! querier; `advertise` and `updateTxt` forward to the Engine and return
+//! `error.NotImplemented` until M4; `deinit` leaves the groups and closes
+//! the sockets (the bounded goodbye flush is M4). The joined (ifindex,
+//! family) pairs are handed to the Engine with `Engine.setJoined` after
+//! every snapshot, so queries go out only where the join succeeded
+//! (Revision 5 item 1). Everything else is the final shape.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -360,6 +363,9 @@ pub const Service = struct {
         /// Datagrams larger than `rx_datagram_size` (`flags.trunc`),
         /// dropped before the Engine sees the cut buffer.
         truncated: u64 = 0,
+        /// Datagrams delivered without a destination-address cmsg
+        /// (`Engine.stats().rx_dst_unknown` counts the same events).
+        no_dst: u64 = 0,
     };
 
     const PendingMutation = union(enum) {
@@ -541,6 +547,7 @@ pub const Service = struct {
                 return error.LimitReached;
             },
         };
+        s.syncJoined();
         return s;
     }
 
@@ -665,6 +672,16 @@ pub const Service = struct {
         };
         _ = s.applySnapshot(&snap);
         try s.engine.setInterfaces(s.table.slice(), s.last_now_us);
+        s.syncJoined();
+    }
+
+    /// Tell the Engine which (ifindex, family) pairs are joined, so it
+    /// queries (and, in M4, announces) only there.
+    fn syncJoined(s: *Service) void {
+        for (s.table.slice(), 0..) |*iface, i| {
+            s.engine.setJoined(iface.index, .v4, s.joined[i].v4);
+            s.engine.setJoined(iface.index, .v6, s.joined[i].v6);
+        }
     }
 
     /// Number of interfaces with at least one joined family.
@@ -761,13 +778,13 @@ pub const Service = struct {
     // Plan 4.2: "The Service queues them and applies them at the start of
     // the next tick". `withdraw` and `stopBrowse` already go through
     // `PendingMutation`; `advertise`, `updateTxt` and `browse` call the
-    // Engine directly while it is a stub. M3/M4 must add `advertise`,
+    // Engine directly with `last_now_us`. M4/M5 must add `advertise`,
     // `update_txt` and `browse` variants to `PendingMutation` (with the
     // `ServiceDesc` / TXT data copied into the variant, since the caller's
     // slices do not outlive the call) so the queued-at-next-tick contract
     // holds for every mutation.
 
-    /// M2 stub (M4 fills it): always `error.NotImplemented`.
+    /// M4 fills it: always `error.NotImplemented`.
     pub fn advertise(s: *Service, desc: ServiceDesc) AdvertiseError!RegId {
         return s.engine.advertise(desc, s.last_now_us);
     }
@@ -777,14 +794,22 @@ pub const Service = struct {
         s.queueMutation(.{ .withdraw = id });
     }
 
-    /// M2 stub (M4 fills it): always `error.NotImplemented`.
+    /// M4 fills it: always `error.NotImplemented`.
     pub fn updateTxt(s: *Service, id: RegId, txt: []const TxtPair) UpdateTxtError!void {
         return s.engine.updateTxt(id, txt, s.last_now_us);
     }
 
-    /// M2 stub (M3 fills it): always `error.NotImplemented`.
+    /// Start a browse; the first query goes out 20-120 ms later, at the
+    /// next `tick` / `step`. In mode A the browse is stamped with the
+    /// last tick's clock (`last_now_us`). Before the first call and in
+    /// modes B/C it is stamped with `nowUs()` (never below
+    /// `last_now_us`), so the 20-120 ms delay counts from the call, not
+    /// from `init` (the `init` -> `browse` -> `run` pattern of
+    /// `examples/browse.zig`). `last_now_us` itself is untouched: a mode
+    /// A embedder whose clock starts near zero is not pushed forward.
     pub fn browse(s: *Service, service_type: []const u8) BrowseError!BrowseId {
-        return s.engine.browse(service_type, s.last_now_us);
+        const at = if (s.mode == .tick) s.last_now_us else @max(s.last_now_us, s.nowUs());
+        return s.engine.browse(service_type, at);
     }
 
     /// Queued; applied at the start of the next `tick` / `step`.
@@ -959,8 +984,7 @@ pub const Service = struct {
     /// `out` (a later `resolved` for the same instance replaces the
     /// earlier copy), stop the browse on every exit path. Returns when
     /// `out` is full, after `timeout_us`, or after `quiet_us` with at
-    /// least one result and no new `resolved`. M2 stub (M3 fills it): the
-    /// browse itself returns `error.NotImplemented`.
+    /// least one result and no new `resolved`.
     pub fn lookup(s: *Service, service_type: []const u8, opts: LookupOptions, out: []Resolved) LookupError!usize {
         s.bindMode(.step);
         const start = s.nowUs();
@@ -1077,11 +1101,17 @@ pub const Service = struct {
         if (from == .ip6 and from.ip6.interface.index == 0 and meta.ifindex != 0) {
             from.ip6.interface = .{ .index = meta.ifindex };
         }
+        // No destination cmsg (a socket where IP_RECVDSTADDR /
+        // IPV6_RECVPKTINFO silently failed): the Engine applies the
+        // section 11 on-link check as for unicast but skips the QU-window
+        // drop, and counts it in `stats.rx_dst_unknown`
+        // (docs/platform-matrix.md, "Destination address").
+        if (meta.dst_multicast == null) s.rx.no_dst += 1;
         s.engine.handle(m.data, .{
             .from = from,
             .ifindex = meta.ifindex,
-            // No destination cmsg: the on-link check treats it as unicast.
             .dst_multicast = meta.dst_multicast orelse false,
+            .dst_known = meta.dst_multicast != null,
             .ttl = meta.ttl,
         }, now_us);
     }
@@ -1184,7 +1214,10 @@ pub const Service = struct {
         if (s.no_packets_warned) return;
         const first_tx = s.first_tx_us orelse return;
         if (s.joinedCount() == 0) return;
-        if (s.engine.stats().rx != 0) return;
+        // `rx` counts our own echoes too; only foreign packets disprove
+        // the signature.
+        const st = s.engine.stats();
+        if (st.rx - st.rx_echo != 0) return;
         if (now_us - first_tx < no_packets_window_us) return;
         s.no_packets_warned = true;
         s.pushWarning(.no_packets_10s);
@@ -1220,8 +1253,8 @@ test "tick drains sockets only after rx_poll_interval_us" {
         // First tick: nothing drained yet, so it drains.
         try svc.tick(0);
         try testing.expectEqual(@as(?u64, 0), svc.last_drain_us);
-        // Inside the 5 ms interval with the stub deadline 2 s away: no
-        // drain, the stamp stays.
+        // Inside the 5 ms interval with no Engine deadline: no drain, the
+        // stamp stays.
         try svc.tick(4_000);
         try testing.expectEqual(@as(?u64, 0), svc.last_drain_us);
         try svc.tick(4_999);
@@ -1231,9 +1264,28 @@ test "tick drains sockets only after rx_poll_interval_us" {
         try testing.expectEqual(@as(?u64, 5_000), svc.last_drain_us);
         try svc.tick(9_000);
         try testing.expectEqual(@as(?u64, 5_000), svc.last_drain_us);
-        // A due Engine deadline drains inside the interval.
-        try svc.tick(Engine.stub_query_interval_us + 1);
-        try testing.expectEqual(@as(?u64, Engine.stub_query_interval_us + 1), svc.last_drain_us);
+    }
+    // A due Engine deadline drains inside the interval: a browse's first
+    // query (20-120 ms after `browse`) falls inside a 1 s poll interval.
+    {
+        const bogus = [_]u32{4_000_000};
+        var svc = Service.init(testing.allocator, testing.io, .{
+            .host_label = "unit",
+            .interfaces = &bogus,
+            .rx_poll_interval_us = 1_000_000,
+        }) catch |err| switch (err) {
+            error.PermissionDenied, error.AddressInUse => return error.SkipZigTest,
+            else => return err,
+        };
+        defer svc.deinit();
+        try svc.tick(0);
+        _ = try svc.browse("_x._udp");
+        const due = svc.nextDeadline(0).?;
+        try testing.expect(due >= 20_000 and due <= 120_000);
+        try svc.tick(due - 1);
+        try testing.expectEqual(@as(?u64, 0), svc.last_drain_us);
+        try svc.tick(due);
+        try testing.expectEqual(@as(?u64, due), svc.last_drain_us);
     }
 
     // The predicate, with a fake clock. Nothing drained yet: drain.
@@ -1369,6 +1421,109 @@ test "join_failed warning carries ifindex and family" {
     try testing.expect(got_v4);
     try testing.expectEqual(svc.hasIpv6(), got_v6);
     try testing.expectEqual(@as(usize, 0), svc.joinedCount());
+}
+
+fn dualIface(index: u32) Interface {
+    var iface: Interface = .{ .index = index };
+    iface.v4.append(.{ .addr = .{ 10, 254, 254, 254 }, .prefix_len = 24 }) catch unreachable; // capacity 8
+    var a6: [16]u8 = @splat(0);
+    a6[0] = 0xfe;
+    a6[1] = 0x80;
+    a6[15] = 1;
+    iface.v6.append(.{ .addr = a6, .prefix_len = 64 }) catch unreachable; // capacity 8
+    return iface;
+}
+
+test "syncJoined carries a failed join into the Engine" {
+    // Revision 5 item 1, Service half: the Engine defaults every family
+    // with an address to joined; `syncJoined` overrides it with what the
+    // sockets actually joined, so a browse queries only on those pairs.
+    var svc = try initUnjoinedOrSkip();
+    defer svc.deinit();
+    const bogus: u32 = 4_000_000;
+    svc.table.items[0] = dualIface(bogus);
+    svc.table.len = 1;
+    try svc.engine.setInterfaces(svc.table.slice(), 0);
+    try testing.expect(svc.engine.isJoined(bogus, .v4));
+    try testing.expect(svc.engine.isJoined(bogus, .v6));
+    // The v6 join failed (Linux `lo`, or here: a bogus interface).
+    svc.joined[0] = .{ .v4 = true, .v6 = false };
+    svc.syncJoined();
+    try testing.expect(svc.engine.isJoined(bogus, .v4));
+    try testing.expect(!svc.engine.isJoined(bogus, .v6));
+    // The browse's first tick queues one datagram, v4 only.
+    _ = try svc.engine.browse("_x._udp", 0);
+    const due = svc.engine.nextDeadline(0).?;
+    svc.engine.tick(due);
+    const d = svc.engine.pollDatagram(svc.tx_buf, due).?;
+    try testing.expect(d.to == .ip4);
+    try testing.expectEqual(bogus, d.ifindex);
+    try testing.expectEqual(@as(?Engine.TxDatagram, null), svc.engine.pollDatagram(svc.tx_buf, due));
+    // Both joined again: v4 then v6.
+    svc.joined[0] = .{ .v4 = true, .v6 = true };
+    svc.syncJoined();
+    const due2 = svc.engine.nextDeadline(due).?;
+    svc.engine.tick(due2);
+    try testing.expect(svc.engine.pollDatagram(svc.tx_buf, due2).?.to == .ip4);
+    try testing.expect(svc.engine.pollDatagram(svc.tx_buf, due2).?.to == .ip6);
+}
+
+test "no_packets_10s warning ignores own echoes" {
+    // Plan 4.6: `tx > 0` with no foreign packet for 10 s. Our own looped
+    // back queries count in `rx` (and `rx_echo`); they must not hide
+    // the signature.
+    var svc = try initUnjoinedOrSkip();
+    defer svc.deinit();
+    const bogus: u32 = 4_000_000;
+    svc.table.items[0] = dualIface(bogus);
+    svc.table.len = 1;
+    try svc.engine.setInterfaces(svc.table.slice(), 0);
+    svc.joined[0] = .{ .v4 = true, .v6 = false };
+    svc.first_tx_us = 0;
+    var evs: [8]Event = undefined;
+    _ = svc.poll(&evs);
+    // A query we sent comes back from our own address: an echo.
+    var qb: [64]u8 = @splat(0);
+    qb[5] = 1; // qdcount 1
+    qb[12] = 1;
+    qb[13] = 'x';
+    qb[16] = 12; // PTR
+    qb[18] = 1; // IN
+    const query = qb[0..19];
+    svc.engine.echoes.record(query, 0);
+    svc.engine.handle(query, .{ .from = .{ .ip4 = .{ .bytes = .{ 10, 254, 254, 254 }, .port = 5353 } }, .ifindex = bogus, .dst_multicast = true }, 0);
+    try testing.expectEqual(@as(u64, 1), svc.engine.stats().rx);
+    try testing.expectEqual(@as(u64, 1), svc.engine.stats().rx_echo);
+    svc.checkNoPackets(9 * 1_000_000);
+    try testing.expectEqual(@as(usize, 0), svc.poll(&evs));
+    svc.checkNoPackets(10 * 1_000_000);
+    try testing.expectEqual(@as(usize, 1), svc.poll(&evs));
+    try testing.expect(evs[0] == .warning and evs[0].warning == .no_packets_10s);
+    // A foreign packet disproves it: no warning even after 10 s.
+    svc.no_packets_warned = false;
+    svc.engine.handle(query, .{ .from = .{ .ip4 = .{ .bytes = .{ 10, 254, 254, 9 }, .port = 5353 } }, .ifindex = bogus, .dst_multicast = true }, 0);
+    try testing.expectEqual(@as(u64, 2), svc.engine.stats().rx);
+    svc.checkNoPackets(20 * 1_000_000);
+    try testing.expectEqual(@as(usize, 0), svc.poll(&evs));
+}
+
+test "browse before the first step is stamped with the current clock" {
+    // `init` -> `browse` -> `run`: the 20-120 ms first-query delay
+    // counts from the browse call, not from `init` (mode unset, and
+    // modes B/C). `last_now_us` stays 0 for a mode A embedder.
+    var svc = try initUnjoinedOrSkip();
+    defer svc.deinit();
+    (Io.Clock.Duration{ .raw = .fromMilliseconds(150), .clock = .awake }).sleep(testing.io) catch |err| switch (err) {
+        error.Canceled => return error.SkipZigTest,
+    };
+    const before = svc.nowUs();
+    try testing.expect(before >= 150_000);
+    _ = try svc.browse("_x._udp");
+    const due = svc.nextDeadline(before).?;
+    try testing.expect(due >= before + 20_000);
+    try testing.expect(due <= svc.nowUs() + 120_000);
+    try testing.expectEqual(@as(u64, 0), svc.last_now_us);
+    try testing.expectEqual(Mode.unset, svc.mode);
 }
 
 const CancelProbe = struct {
