@@ -43,18 +43,38 @@ pub fn build(b: *std.Build) void {
     if (b.pkg_hash.len != 0) return;
 
     // ---- test -----------------------------------------------------------
-    const unit_tests = b.addTest(.{ .root_module = mdns });
+    // `--fuzz` needs sancov coverage sections, which only the LLVM backend
+    // emits (quic-zig build.zig: the self-hosted x86_64 backend produces a
+    // binary that fuzzes with zero coverage and then dies with "pcs_len was
+    // zero"). On this pin aarch64 already defaults to LLVM; the option is
+    // for x86_64 hosts and CI. Off by default because the self-hosted
+    // backend builds faster for every ordinary `zig build test`.
+    // `false` is mapped to "compiler default" rather than `-fno-llvm`: the
+    // self-hosted aarch64 backend hung the test compile on this pin.
+    const use_llvm: ?bool = if (b.option(
+        bool,
+        "use-llvm",
+        "Build the test binaries with the LLVM backend (pass with --fuzz on x86_64 so the fuzzer sees coverage)",
+    ) orelse false) true else null;
+
+    // Absolute path of this checkout for tests that read repo files at
+    // runtime (docs/conformance.md, tests/fixtures/raw). Absolute so the
+    // test binary does not depend on the cwd `zig build` was launched from.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "repo_root", repoRoot(b));
+
+    const unit_tests = b.addTest(.{ .root_module = mdns, .use_llvm = use_llvm });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
-    const api_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{.{ .name = "mdns", .module = mdns }},
-        }),
+    const tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mdns", .module = mdns }},
     });
+    tests_mod.addOptions("build_options", build_options);
+    const api_tests = b.addTest(.{ .root_module = tests_mod, .use_llvm = use_llvm });
     const run_api_tests = b.addRunArtifact(api_tests);
 
     const test_step = b.step("test", "Run unit and public-API tests");
@@ -110,4 +130,19 @@ pub fn build(b: *std.Build) void {
     // ---- live -----------------------------------------------------------
     // Real-socket tests land in M2 (tests/live/). Placeholder step.
     _ = b.step("live", "Run loopback and live-socket tests (M2)");
+}
+
+/// Absolute path of the directory holding this build.zig. `b.root` is a
+/// `Cache.Path` whose `root_dir.path` is null (cwd) or relative to the cwd
+/// the configurer was launched from; `realPath` makes it absolute so a test
+/// binary can open repo files from any cwd.
+fn repoRoot(b: *std.Build) []const u8 {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = b.root.root_dir.handle;
+    const n = (if (b.root.sub_path.len == 0)
+        dir.realPath(b.graph.io, &buf)
+    else
+        dir.realPathFile(b.graph.io, b.root.sub_path, &buf)) catch |err|
+        std.debug.panic("cannot resolve the build root: {t}", .{err});
+    return b.dupe(buf[0..n]);
 }

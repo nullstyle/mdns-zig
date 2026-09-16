@@ -1,8 +1,9 @@
 # Packet fixtures
 
-Raw mDNS datagrams captured off a real LAN, used (from M1 on) as a decode
-corpus for the wire codec. M0 only captures and describes them; no test
-reads them yet.
+Raw mDNS datagrams captured off a real LAN, used as a decode corpus for
+the wire codec. `tests/fixtures/loader.zig` iterates them;
+`tests/codec_test.zig` parses, decodes and re-encodes every one, and
+`tests/fuzz_test.zig` embeds a handful as fuzz seeds.
 
 ## Layout
 

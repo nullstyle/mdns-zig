@@ -30,6 +30,28 @@ fmt-check:
     mise fmt --check
     {{zig}} fmt --check build.zig src tests spikes
 
+# `N` is a run count PER FUZZ TARGET with an optional K/M/G suffix
+# (`--fuzz=N`; there is no time flag; the report prints the first target's
+# name with totals over all of them). 2M is about 60 s on an M-series Mac
+# for the four codec targets. The whole test step is the fuzz target set: a
+# filtered test binary under --fuzz aborts the build runner
+# (ziglang/zig#25352), so never combine this with `-Dtest-filter`. `-Duse-llvm=true` makes the fuzzer see
+# coverage on x86_64 (aarch64 already defaults to LLVM); see build.zig.
+# Coverage-guided fuzzing over every std.testing.fuzz target, e.g. `just fuzz 10K`.
+fuzz N="10K":
+    {{zig}} build test -Duse-llvm=true --fuzz={{N}}
+
+# Prints every RFC clause whose Status is not yet `done`, then runs the
+# guard test that greps the doc for the named tests.
+# Conformance matrix: open items and the docs/conformance.md guard test.
+conformance:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "conformance: rows not yet done (docs/conformance.md)"
+    awk -F'|' 'NF==6 && $4 !~ /Status|^ *done *$|^-+$/ { gsub(/^ +| +$/, "", $2); gsub(/^ +| +$/, "", $4); printf "  %-6s %s\n", $4, $2 }' docs/conformance.md
+    echo "conformance: done rows: $(awk -F'|' 'NF==6 && $4 ~ /^ *done *$/' docs/conformance.md | wc -l | tr -d ' ')"
+    {{zig}} build test
+
 # On macOS run from Terminal or SSH: GUI-launched processes may lack Local
 # Network permission and silently see zero packets.
 # Loopback and live-socket tests (real sockets on shared 5353).
