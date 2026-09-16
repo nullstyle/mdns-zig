@@ -1,12 +1,19 @@
 //! Record cache for the querier (plan section 4.5 "cache model", section
 //! 6 `core/cache.zig`): a preallocated pool of resource records keyed by
-//! `(name, type, class)`, with the RFC 6762 rules that act on cached
-//! records:
+//! `(name, type, class, ifindex)`, with the RFC 6762 rules that act on
+//! cached records:
 //!
 //! - section 10.2 cache-flush: a record with the cache-flush bit marks
 //!   every other record of the same key that was received more than 1 s
 //!   ago to expire in 1 s; younger records are kept (they may be part of
-//!   the same burst);
+//!   the same burst). The key includes the arrival interface, so a
+//!   cache-flush answer heard on one interface never flushes what was
+//!   heard on another: a multi-homed responder MUST answer on each
+//!   interface with only that interface's addresses (section 6.2) and a
+//!   multihomed querier keeps the results of each link apart (section
+//!   14; mDNSResponder does the same, one `dns-sd -B` row per
+//!   interface). Merging them would make every interface's answer flush
+//!   the others' addresses in turn (the M3 gate "resolved flicker");
 //! - section 10.1 goodbye: a record with TTL 0 is recorded with a TTL of
 //!   1 s and removed one second later, so a cooperating responder has
 //!   time to defend it;
@@ -16,9 +23,14 @@
 //! - section 7.1 known-answer half-TTL rule (`Entry.pastHalfTtl`).
 //!
 //! Names compare ASCII case-insensitively (RFC 6762 section 16). Records
-//! with the same key form one RRSet: `lookup` walks it, `upsert` updates
-//! one member in place, so the order of records inside a packet does not
-//! matter (hashicorp/mdns #145, #92).
+//! with the same key form one RRSet: `lookupOn` walks it, `upsert`
+//! updates one member in place, so the order of records inside a packet
+//! does not matter (hashicorp/mdns #145, #92). `lookup` walks the RRSets
+//! of every interface for `(name, type, class)` (they share one bucket
+//! chain: the hash leaves the interface out). A record heard on k
+//! interfaces costs k entries; size `max_cache_records` as interfaces x
+//! records per instance x instances. An arrival interface of 0 (a
+//! platform that reports none) is a scope of its own.
 //!
 //! Allocation happens once, in `init`; `upsert`, `lookup`, `expireDue`
 //! and every other call after that never allocate and never fail with
@@ -134,8 +146,14 @@ pub const Entry = struct {
         return e.rdata[0..e.rdata_len];
     }
 
-    /// True when `(name, rtype, class)` matches, name case folded.
-    pub fn keyEql(e: *const Entry, name: *const Name, rtype: RType, class: u16) bool {
+    /// True when the full key `(name, rtype, class, ifindex)` matches,
+    /// name case folded.
+    pub fn keyEql(e: *const Entry, name: *const Name, rtype: RType, class: u16, ifindex: u32) bool {
+        return e.ifindex == ifindex and e.rrsetEql(name, rtype, class);
+    }
+
+    /// True when `(name, rtype, class)` matches on any interface.
+    pub fn rrsetEql(e: *const Entry, name: *const Name, rtype: RType, class: u16) bool {
         return e.rtype == rtype and e.class == class and e.name.eql(name);
     }
 
@@ -180,8 +198,8 @@ pub const Outcome = enum {
     /// The same record (key and rdata) was already cached but was
     /// pending removal (goodbye or flush); it is live again.
     updated,
-    /// The same record was already cached and live; its TTL,
-    /// `received_us`, `ifindex` and `cache_flush_seen` were refreshed.
+    /// The same record was already cached and live on that interface;
+    /// its TTL, `received_us` and `cache_flush_seen` were refreshed.
     unchanged,
     /// A TTL-0 goodbye: the matching entry (if any) now expires in 1 s.
     goodbye,
@@ -192,7 +210,8 @@ pub const Outcome = enum {
 
 pub const UpsertResult = struct {
     outcome: Outcome,
-    /// Same-key entries marked to expire by the section 10.2 rule.
+    /// Same-key (same interface) entries marked to expire by the section
+    /// 10.2 rule.
     flushed_count: u32 = 0,
     /// A TXT rdata was cut to whole strings within 400 octets.
     truncated: bool = false,
@@ -340,7 +359,7 @@ pub const Cache = struct {
         var i = c.buckets[b];
         while (i != none) : (i = c.entries[i].next_in_bucket) {
             const e = &c.entries[i];
-            if (e.keyEql(&rec.name, rec.rtype, rec.class) and
+            if (e.keyEql(&rec.name, rec.rtype, rec.class, rec.ifindex) and
                 std.mem.eql(u8, e.rdataSlice(), rec.rdata))
             {
                 return i;
@@ -356,9 +375,10 @@ pub const Cache = struct {
     /// reported as `rejected` and counted.
     ///
     /// Order of effects: (1) with `cache_flush`, every other live entry
-    /// of the same key received more than 1 s ago is marked to expire
-    /// 1 s from `now_us` (`flushed_count`); (2) a TTL 0 marks the
-    /// matching entry (if any) as a goodbye expiring in 1 s; (3) otherwise
+    /// of the same key (same arrival interface) received more than 1 s
+    /// ago is marked to expire 1 s from `now_us` (`flushed_count`); (2) a
+    /// TTL 0 marks the matching entry (if any) as a goodbye expiring in
+    /// 1 s; (3) otherwise
     /// the matching entry is refreshed, or a new one is created, evicting
     /// the soonest-expiring unpinned entry (or, with everything pinned,
     /// the soonest-expiring pinned one) when the pool is full; `on_evict`
@@ -408,7 +428,6 @@ pub const Cache = struct {
                 e.ttl_s = 1;
                 e.received_us = now_us;
                 e.expires_us = now_us +| goodbye_grace_us;
-                e.ifindex = rec.ifindex;
                 e.flags.goodbye_pending = true;
                 e.flags.flush_pending = false;
                 if (cache_flush) e.flags.cache_flush_seen = true;
@@ -465,10 +484,12 @@ pub const Cache = struct {
         @memcpy(e.rdata[0..rec.rdata.len], rec.rdata);
     }
 
-    /// Section 10.2: mark same-key entries other than `keep` that were
-    /// received more than 1 s ago to expire 1 s from now. Entries already
-    /// due sooner keep their earlier expiry. Returns how many were newly
-    /// marked.
+    /// Section 10.2: mark same-key entries (same name, type, class AND
+    /// arrival interface) other than `keep` that were received more than
+    /// 1 s ago to expire 1 s from now. Entries already due sooner keep
+    /// their earlier expiry. Returns how many were newly marked. Records
+    /// of the same RRSet heard on another interface are untouched (RFC
+    /// 6762 sections 6.2, 14: each interface's answer is its own RRSet).
     fn flushOthers(c: *Cache, rec: *const Record, keep: ?u32, now_us: u64) u32 {
         var flushed: u32 = 0;
         const b = c.bucketOf(&rec.name, rec.rtype, rec.class);
@@ -476,7 +497,7 @@ pub const Cache = struct {
         while (i != none) : (i = c.entries[i].next_in_bucket) {
             if (keep != null and keep.? == i) continue;
             const e = &c.entries[i];
-            if (!e.keyEql(&rec.name, rec.rtype, rec.class)) continue;
+            if (!e.keyEql(&rec.name, rec.rtype, rec.class, rec.ifindex)) continue;
             if (e.flags.goodbye_pending or e.flags.flush_pending) continue;
             // "received more than one second ago": exactly one second is
             // not more.
@@ -572,6 +593,28 @@ pub const Cache = struct {
         return removed;
     }
 
+    /// Remove every entry heard on `ifindex`, calling `callback(ctx,
+    /// entry)` for each one before it is unlinked, exactly as `expireDue`
+    /// does (the querier emits `lost` and drops resolve state there).
+    /// For an interface that left the table: its records can never be
+    /// refreshed (no answer arrives with that ifindex again; answers on
+    /// the surviving interfaces land in their own keys) and they would
+    /// otherwise linger until their TTL, emit `lost` for an interface
+    /// that vanished long before, or attach to an unrelated interface if
+    /// the OS reuses the index. Returns the number removed. Never
+    /// allocates.
+    pub fn expireInterface(c: *Cache, ifindex: u32, ctx: anytype, comptime callback: fn (@TypeOf(ctx), *const Entry) void) usize {
+        var removed: usize = 0;
+        for (c.entries, 0..) |*e, i| {
+            if (!e.used) continue;
+            if (e.ifindex != ifindex) continue;
+            callback(ctx, e);
+            c.remove(@intCast(i));
+            removed += 1;
+        }
+        return removed;
+    }
+
     /// Remove everything. Counters are kept.
     pub fn clear(c: *Cache) void {
         for (c.entries, 0..) |*e, i| {
@@ -646,9 +689,9 @@ pub const Cache = struct {
 
     // ---- lookup -------------------------------------------------------
 
-    /// Walk the RRSet for `(name, rtype, class)`; entries include those
-    /// pending removal (check `Entry.isLive`). Do not `remove` or
-    /// `upsert` during the walk.
+    /// Walk every entry for `(name, rtype, class)` on every interface;
+    /// entries include those pending removal (check `Entry.isLive`). Do
+    /// not `remove` or `upsert` during the walk.
     pub fn lookup(c: *Cache, name: *const Name, rtype: RType, class: u16) Iterator {
         return .{
             .cache = c,
@@ -656,7 +699,15 @@ pub const Cache = struct {
             .name = name,
             .rtype = rtype,
             .class = class,
+            .ifindex = null,
         };
+    }
+
+    /// Walk the RRSet for `(name, rtype, class)` as heard on `ifindex`.
+    pub fn lookupOn(c: *Cache, name: *const Name, rtype: RType, class: u16, ifindex: u32) Iterator {
+        var it = c.lookup(name, rtype, class);
+        it.ifindex = ifindex;
+        return it;
     }
 
     pub const Iterator = struct {
@@ -665,21 +716,35 @@ pub const Cache = struct {
         name: *const Name,
         rtype: RType,
         class: u16,
+        /// Null: every interface.
+        ifindex: ?u32,
 
         pub fn next(it: *Iterator) ?*Entry {
             while (it.next_index != none) {
                 const e = &it.cache.entries[it.next_index];
                 it.next_index = e.next_in_bucket;
-                if (e.keyEql(it.name, it.rtype, it.class)) return e;
+                if (!e.rrsetEql(it.name, it.rtype, it.class)) continue;
+                if (it.ifindex) |i| if (e.ifindex != i) continue;
+                return e;
             }
             return null;
         }
     };
 
-    /// Number of live entries in the RRSet.
+    /// Number of live entries for the key over every interface.
     pub fn countLive(c: *Cache, name: *const Name, rtype: RType, class: u16) usize {
         var n: usize = 0;
         var it = c.lookup(name, rtype, class);
+        while (it.next()) |e| {
+            if (e.isLive()) n += 1;
+        }
+        return n;
+    }
+
+    /// Number of live entries in the RRSet heard on `ifindex`.
+    pub fn countLiveOn(c: *Cache, name: *const Name, rtype: RType, class: u16, ifindex: u32) usize {
+        var n: usize = 0;
+        var it = c.lookupOn(name, rtype, class, ifindex);
         while (it.next()) |e| {
             if (e.isLive()) n += 1;
         }
@@ -1145,7 +1210,6 @@ test "upsert with identical rdata refreshes TTL and reports unchanged" {
     try testing.expect(e.pastHalfTtl(70 * us_per_s));
 
     rec.ttl_s = 4500;
-    rec.ifindex = 2;
     r = c.upsert(rec, 100 * us_per_s, true, .none);
     try testing.expectEqual(Outcome.unchanged, r.outcome);
     try testing.expectEqual(r.index, @as(?u32, 0));
@@ -1153,13 +1217,116 @@ test "upsert with identical rdata refreshes TTL and reports unchanged" {
     try testing.expectEqual(@as(u32, 4500), e.ttl_s);
     try testing.expectEqual(@as(u64, 100 * us_per_s), e.received_us);
     try testing.expectEqual(@as(u64, 4600 * us_per_s), e.expires_us);
-    try testing.expectEqual(@as(u32, 2), e.ifindex);
+    try testing.expectEqual(@as(u32, 1), e.ifindex);
     try testing.expect(e.flags.cache_flush_seen);
     try testing.expectEqual(@as(u32, 0), r.flushed_count);
     try testing.expectEqual(@as(?u64, 4600 * us_per_s), c.nextExpiryUs());
+
+    // The same record heard on another interface is a distinct entry
+    // (RFC 6762 section 14; the key is (name, type, class, ifindex)),
+    // and its cache-flush bit flushes nothing on interface 1. (Before
+    // the P2 fix this refresh reported `unchanged` and moved the entry
+    // to ifindex 2.)
+    const host = nameOf("box.local");
+    rec.ifindex = 2;
+    r = c.upsert(rec, 100 * us_per_s, true, .none);
+    try testing.expectEqual(Outcome.added, r.outcome);
+    try testing.expectEqual(@as(u32, 0), r.flushed_count);
+    try testing.expectEqual(@as(usize, 2), c.count());
+    try testing.expectEqual(@as(usize, 2), c.countLive(&host, .a, wire.class_in));
+    try testing.expectEqual(@as(usize, 1), c.countLiveOn(&host, .a, wire.class_in, 1));
+    try testing.expectEqual(@as(usize, 1), c.countLiveOn(&host, .a, wire.class_in, 2));
+    try testing.expectEqual(@as(usize, 0), c.countLiveOn(&host, .a, wire.class_in, 3));
+    try testing.expectEqual(@as(u32, 2), c.entryAt(r.index.?).ifindex);
+    try testing.expectEqual(@as(u32, 1), e.ifindex);
+    rec.ifindex = 1;
     // Time saturates instead of wrapping.
     r = c.upsert(rec, std.math.maxInt(u64) - 1, false, .none);
     try testing.expectEqual(@as(u64, std.math.maxInt(u64)), e.expires_us);
+}
+
+test "cache-flush only flushes records from the same interface" {
+    // RFC 6762 sections 6.2 and 14 (and section 10.2 as mDNSResponder
+    // applies it, per InterfaceID): a multi-homed responder answers on
+    // each interface with only that interface's addresses, cache-flush
+    // set. A querier that merged the interfaces would let each answer
+    // flush the other interface's address after the 1 s grace, cycling
+    // the address set forever (the M3 gate "resolved flicker"). The
+    // cache key carries the arrival interface, so a flush is scoped to
+    // it.
+    var c = try Cache.init(testing.allocator, 16, 0x1234);
+    defer c.deinit(testing.allocator);
+    const host = nameOf("box.local");
+    const ip1: [4]u8 = .{ 10, 0, 1, 7 };
+    const ip2: [4]u8 = .{ 10, 0, 2, 7 };
+    const ip3: [4]u8 = .{ 10, 0, 1, 8 };
+    var on1 = a4("box.local", &ip1, 120);
+    on1.ifindex = 1;
+    var on2 = a4("box.local", &ip2, 120);
+    on2.ifindex = 2;
+    _ = c.upsert(on1, 0, true, .none);
+    _ = c.upsert(on2, 0, true, .none);
+    try testing.expectEqual(@as(usize, 2), c.count());
+
+    // 5 s later interface 1 hears a cache-flush A with a new address:
+    // ip1 (same interface, older than 1 s) is flushed, ip2 (interface
+    // 2) is untouched.
+    var on1b = a4("box.local", &ip3, 120);
+    on1b.ifindex = 1;
+    var r = c.upsert(on1b, 5 * us_per_s, true, .none);
+    try testing.expectEqual(Outcome.added, r.outcome);
+    try testing.expectEqual(@as(u32, 1), r.flushed_count);
+    try testing.expectEqual(@as(usize, 3), c.count());
+    try testing.expectEqual(@as(usize, 1), c.countLiveOn(&host, .a, wire.class_in, 1));
+    try testing.expectEqual(@as(usize, 1), c.countLiveOn(&host, .a, wire.class_in, 2));
+    var it = c.lookupOn(&host, .a, wire.class_in, 1);
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.rdataSlice(), &ip1)) {
+            try testing.expect(e.flags.flush_pending);
+            try testing.expectEqual(@as(u64, 6 * us_per_s), e.expires_us);
+        } else {
+            try testing.expect(e.isLive());
+        }
+    }
+    it = c.lookupOn(&host, .a, wire.class_in, 2);
+    const only2 = it.next().?;
+    try testing.expect(only2.isLive());
+    try testing.expectEqualSlices(u8, &ip2, only2.rdataSlice());
+    try testing.expectEqual(@as(?*Entry, null), it.next());
+
+    // The mirror image: a cache-flush refresh of ip2 on interface 2
+    // flushes nothing (ip2 is the record itself, ip1/ip3 are on
+    // interface 1), and a cache-flush of ip1's rdata arriving on
+    // interface 2 is a new entry there that flushes only ip2.
+    r = c.upsert(on2, 5 * us_per_s, true, .none);
+    try testing.expectEqual(Outcome.unchanged, r.outcome);
+    try testing.expectEqual(@as(u32, 0), r.flushed_count);
+    var on2b = a4("box.local", &ip1, 120);
+    on2b.ifindex = 2;
+    r = c.upsert(on2b, 7 * us_per_s, true, .none);
+    try testing.expectEqual(Outcome.added, r.outcome);
+    try testing.expectEqual(@as(u32, 1), r.flushed_count);
+    try testing.expectEqual(@as(usize, 1), c.countLiveOn(&host, .a, wire.class_in, 1));
+    try testing.expectEqual(@as(usize, 1), c.countLiveOn(&host, .a, wire.class_in, 2));
+    try testing.expectEqual(@as(usize, 2), c.countLive(&host, .a, wire.class_in));
+
+    // Expiry removes exactly the two flushed entries (ip1 on 1 at 6 s,
+    // ip2 on 2 at 8 s).
+    var log: ExpiredLog = .{};
+    try testing.expectEqual(@as(usize, 1), c.expireDue(6 * us_per_s, &log, ExpiredLog.on));
+    try testing.expectEqual(@as(usize, 1), c.expireDue(8 * us_per_s, &log, ExpiredLog.on));
+    try testing.expectEqual(@as(usize, 2), c.count());
+    try testing.expectEqual(@as(usize, 1), c.countLiveOn(&host, .a, wire.class_in, 1));
+    try testing.expectEqual(@as(usize, 1), c.countLiveOn(&host, .a, wire.class_in, 2));
+
+    // A goodbye is scoped the same way: TTL 0 for ip3 on interface 2
+    // (where it was never heard) changes nothing.
+    var bye = a4("box.local", &ip3, 0);
+    bye.ifindex = 2;
+    r = c.upsert(bye, 9 * us_per_s, false, .none);
+    try testing.expectEqual(Outcome.goodbye, r.outcome);
+    try testing.expectEqual(@as(?u32, null), r.index);
+    try testing.expectEqual(@as(usize, 1), c.countLiveOn(&host, .a, wire.class_in, 1));
 }
 
 test "TXT rdata over 400 B is truncated and counted" {

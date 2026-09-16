@@ -2,6 +2,102 @@
 
 ## Unreleased
 
+### M3 gate fixes - Darwin send window; per-interface cache
+
+- P1, `mdns-live` hang on macOS with the default interface set: the
+  first `sendmsg` of a query round could sleep forever. xnu's
+  `sosendcheck` ignores `MSG_DONTWAIT` for the send-buffer wait (only
+  `O_NONBLOCK` / kernel-private `MSG_NBIO` return `EWOULDBLOCK`), and a
+  content filter (`net.cfil`: Little Snitch, Tailscale, Clawpatrol on the
+  gate Mac) holding a fresh multicast flow for a verdict keeps `sbspace`
+  short, so `Io.Threaded`'s DONTWAIT-first timed send never reached its
+  `poll` timeout. `Service` now opens a "send window" on Darwin
+  (`socket_opts.send_window_needs_nonblock`): `O_NONBLOCK` on both
+  sockets for one send batch, cleared before the next receive, so a
+  send the kernel will not take within `send_timeout_us` is
+  `error.Timeout` and a counted drop. `bindMdnsSocket` raises
+  `SO_SNDLOWAT` to `SO_SNDBUF` on Darwin (`raise_send_lowat`) so the
+  post-poll send of the timed path can never see `EWOULDBLOCK` (which
+  Threaded maps to `unreachable`). Linux and the BSDs honour
+  `MSG_DONTWAIT` and are untouched (comptime no-op). New
+  `Service.txCounters()` (`timeouts`, `slow`, `max_us`,
+  `window_failed`), printed by `mdns-live`; `socket_opts.setNonBlockingFlag`,
+  `isNonBlocking`, `getsockoptInt`, `raiseSendLowat`. Tests: `send window
+  sets O_NONBLOCK only while sending`, `send window flag toggles
+  O_NONBLOCK and restores it`, `bound mDNS socket has its send low-water
+  mark raised to the send buffer`, `egress skips a joined pair whose
+  interface has no address of that family` (the pure filter behind
+  Revision 5 item 1, which was already in place). docs/platform-matrix.md
+  "Darwin send path" has the xnu citations and the live result (3/3
+  default-set runs complete in 3.3 s beside `dns-sd -R`).
+- P2, `resolved` flicker with a multi-homed responder: mDNSResponder
+  answers a browse once per interface, each answer carrying only that
+  interface's A/AAAA with cache-flush set, and the `(name, type, class)`
+  cache let every answer flush the other interfaces' addresses after 1 s
+  (7 `resolved` in 8 s cycling three address sets). The cache key is now
+  `(name, type, class, ifindex)` (`Entry.keyEql` takes the interface,
+  `Entry.rrsetEql` is the old three-part compare; `Cache.lookup` walks
+  every interface, `lookupOn` / `countLiveOn` one); cache-flush and
+  goodbye act within one interface; an `Instance` is (PTR target,
+  interface) and every join lookup, pin, requery mark, follow-up and
+  known-answer decision is scoped to it, so `found` / `resolved` / `lost`
+  fire once per interface with that interface's addresses (RFC 6762
+  §6.2, §14; the same per-interfaceIndex model as `dns-sd -B`).
+  `Service.lookup` keeps the plan section 5 contract, one slot per
+  instance: a later `resolved` for the same instance replaces the
+  earlier copy whichever interface it came from (`mergeResolved`, test
+  `lookup keeps one slot per instance across interfaces`), so `out`
+  sized by the expected instance count is enough; the per-interface
+  stream is `browse`'s. Cost: a responder heard on k
+  interfaces uses k copies of each record (README "Known risks" has the
+  sizing rule). Adjusted test: `upsert with identical rdata refreshes TTL
+  and reports unchanged` no longer expects a refresh from another
+  interface to move the entry (it is a second entry now). New tests:
+  `cache-flush only flushes records from the same interface`,
+  `multi-homed responder yields one stable resolved per interface`,
+  `lost fires per interface`, `bridged segments report the same responder
+  once per interface`; `KA half-TTL filter` checks the interface. Live:
+  `mdns-browse _qmsg._udp` beside `dns-sd -R` prints 3 `found` + 3
+  `resolved` (ifindex 15, 25, 27, each with its own addresses) in the
+  first 2 s, nothing more for 8 s, and 3 `lost` after `dns-sd` exits.
+- Review follow-ups on the two fixes:
+  - An interface that leaves the table (`Engine.setInterfaces` from
+    `Service.refreshInterfaces`) now takes its cache scope with it:
+    `Cache.expireInterface` / `Querier.dropInterface` run the expiry
+    path over that interface's records (`lost{ifindex}` for its browsed
+    instances right after `.interfaces_changed`, instances freed, pins
+    dropped), because with the per-interface key nothing could refresh
+    them; before, they lingered to their TTL (a `lost` up to 75 min
+    after the interface vanished), kept requerying on the surviving
+    pairs, and would attach to a reused ifindex. `Engine.pollDatagram`
+    re-checks that a built packet's pair is still joined and counts a
+    stale job in `tx_dropped` instead of handing the platform a pktinfo
+    for an interface it no longer has. Harness: `FakeLan.setInterfaces`.
+    Tests: `interface removal drops its cached records and emits lost`,
+    `pollDatagram drops a queued job for a pair that is no longer
+    joined`.
+  - Follow-up questions and requery marks are scoped to the interface
+    of the instance / record (`Question.ifindex`; `buildNext` leaves
+    them out of the other pairs' packets and encodes each question once
+    per packet, `addDue` treats an every-pair entry as covering the
+    scoped one), so a multi-homed querier's follow-ups no longer
+    multiply with the interface count. Browse PTR questions still go to
+    every joined pair. Test: `follow-ups for an instance found on one
+    interface stay on that interface`.
+  - `Service.flushTx` opens the Darwin send window lazily on the first
+    datagram: an idle step costs no `fcntl` (was 8 per step at the 250
+    ms cap). New `TxCounters.window_opened` (printed by `mdns-live`);
+    `send window sets O_NONBLOCK only while sending` now asserts an
+    empty flush toggles nothing.
+  - docs/platform-matrix.md "Darwin send path": the `Threaded.zig`
+    post-poll send citation is `:2573` (`:2555` is the receive one), and
+    a note on the one send errno class (`EINVAL` & co.) Threaded maps to
+    `errnoBug` (Debug panic), which xnu does not return for an unusable
+    pktinfo interface (`ENXIO` / `EADDRNOTAVAIL`); the joined+addressed
+    pair filter plus the `pollDatagram` re-check is the guard.
+- `tests/live/main.zig` header: if a run hangs, `sample <pid> 2` before
+  killing it.
+
 ### M3 - querier, cache, resolve join; Engine internals replace the stub
 
 - `src/core/querier.zig`: browses with the RFC 6762 section 5.2 ladder
@@ -11,7 +107,8 @@
   known-answer list (section 7.1, half-TTL rule) continued over further
   packets with TC (section 7.2); requery marks at 80/85/90/95 % (+0-2 %)
   only for records a browse cares about; order-independent harvesting of
-  answers and additionals into the `(name, type, class)` cache; `found`
+  answers and additionals into the `(name, type, class)` cache (now
+  `(name, type, class, ifindex)`, see the gate fixes above); `found`
   / `lost` only for browsed types (a foreign PTR is cached silently and a
   later browse starts warm); the `resolved` re-emit rule (again on SRV,
   TXT or address-set change, never on a same-data refresh, `ttl_s` = the

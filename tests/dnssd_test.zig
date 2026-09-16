@@ -678,3 +678,301 @@ test "goodbye for SRV and PTR sends no follow-up queries" {
     try r.sink.expectCount(.resolved, 2);
     try testing.expectEqual(@as(u16, 4434), r.lastResolved().port);
 }
+
+// ---- multi-homed responder: one result per interface ---------------------
+
+/// A querier with two interfaces on two segments, and one responder
+/// present on both (a multi-homed host: same instance, same host name,
+/// a different address on each link, RFC 6762 section 6.2). Segment 1's
+/// copy answers 1.2 s late and known-answer suppression is off, so the
+/// querier keeps receiving cache-flush answers from both interfaces more
+/// than 1 s apart, which is exactly what made the merged cache cycle its
+/// address set on the M3 gate (`resolved` re-emitted every second).
+const multi_table_a = [_]fake_responder.InstanceSpec{
+    .{ .instance = "demo", .service_type = svc_type, .host = "host-d", .port = 4433, .txt = &.{.{ .key = "spki", .value = "00" }}, .addrs4 = &.{.{ 10, 0, 3, 7 }} },
+};
+const multi_table_b = [_]fake_responder.InstanceSpec{
+    .{ .instance = "demo", .service_type = svc_type, .host = "host-d", .port = 4433, .txt = &.{.{ .key = "spki", .value = "00" }}, .addrs4 = &.{.{ 10, 0, 4, 7 }} },
+};
+
+const MultiRig = struct {
+    sc: Scenario,
+    e: Engine,
+    sink: Sink,
+    lan: Lan,
+    ra: FakeResponder,
+    rb: FakeResponder,
+
+    fn init(seed: u64) !*MultiRig {
+        const r = try testing.allocator.create(MultiRig);
+        errdefer testing.allocator.destroy(r);
+        r.sc = .init(seed);
+        r.lan = .init(testing.allocator);
+        r.e = try Engine.init(testing.allocator, .{ .host_label = "mh", .random = r.sc.random() });
+        r.sink = .init(testing.allocator);
+        _ = try r.lan.addEngine(&r.e, &.{
+            fake_lan.iface4(3, "en0", .{ 10, 0, 3, 1 }, 24),
+            fake_lan.iface4(4, "en1", .{ 10, 0, 4, 1 }, 24),
+        }, &.{ 0, 1 }, 0);
+        r.ra = .init(0, .{ 10, 0, 3, 7 }, 7, &multi_table_a, .{ .known_answer_suppression = false });
+        r.rb = .init(1, .{ 10, 0, 4, 7 }, 8, &multi_table_b, .{ .known_answer_suppression = false, .delay_us = 1_200_000 });
+        return r;
+    }
+
+    fn deinit(r: *MultiRig) void {
+        r.lan.deinit();
+        r.sink.deinit();
+        r.e.deinit();
+        testing.allocator.destroy(r);
+    }
+
+    fn drain(ctx: *anyopaque, _: u64) anyerror!void {
+        const r: *MultiRig = @ptrCast(@alignCast(ctx));
+        _ = try r.sink.drain(&r.e);
+    }
+
+    fn runTo(r: *MultiRig, until: u64) !void {
+        try fake_responder.run(&r.lan, &.{ &r.ra, &r.rb }, r.sc.nowUs(), until, 10_000, .{ .ctx = r, .f = drain });
+        r.sc.set(until);
+    }
+
+    /// The `resolved` for `ifindex`, or null.
+    fn resolvedOn(r: *const MultiRig, ifindex: u32) ?mdns.Resolved {
+        var found: ?mdns.Resolved = null;
+        for (r.sink.items()) |ev| switch (ev) {
+            .resolved => |res| if (res.ifindex == ifindex) {
+                found = res;
+            },
+            else => {},
+        };
+        return found;
+    }
+
+    fn countOn(r: *const MultiRig, tag: scenario.EventTag, ifindex: u32) usize {
+        var n: usize = 0;
+        for (r.sink.items()) |ev| {
+            if (std.meta.activeTag(ev) != tag) continue;
+            const i = switch (ev) {
+                .found => |f| f.ifindex,
+                .lost => |l| l.ifindex,
+                .resolved => |res| res.ifindex,
+                else => continue,
+            };
+            if (i == ifindex) n += 1;
+        }
+        return n;
+    }
+};
+
+test "multi-homed responder yields one stable resolved per interface" {
+    // RFC 6762 sections 6.2 and 14: each interface's answer is its own
+    // RRSet with cache-flush set; the querier keeps them apart and
+    // reports one `found` and one `resolved` per interface, each with
+    // only that interface's address, and never re-emits while nothing
+    // changes. Before the fix this rig produced found=1 and resolved=7
+    // over 10 s, cycling {3.7}, {4.7, 3.7}, {4.7}, ... as each
+    // interface's cache-flush answer flushed the other's address.
+    var r = try MultiRig.init(51);
+    defer r.deinit();
+    _ = try r.e.browse(svc_type, 0);
+    try r.runTo(10 * s_us);
+    try r.sink.expectCount(.found, 2);
+    try r.sink.expectCount(.resolved, 2);
+    try r.sink.expectCount(.lost, 0);
+    try testing.expectEqual(@as(usize, 1), r.countOn(.found, 3));
+    try testing.expectEqual(@as(usize, 1), r.countOn(.found, 4));
+    const on3 = r.resolvedOn(3).?;
+    const on4 = r.resolvedOn(4).?;
+    try testing.expectEqual(@as(usize, 1), on3.addrs.len);
+    try testing.expectEqual(@as(usize, 1), on4.addrs.len);
+    try testing.expectEqual([4]u8{ 10, 0, 3, 7 }, on3.addrs.slice()[0].ip4.bytes);
+    try testing.expectEqual([4]u8{ 10, 0, 4, 7 }, on4.addrs.slice()[0].ip4.bytes);
+    try testing.expectEqual(@as(u16, 4433), on3.port);
+    try testing.expectEqual(@as(u16, 4433), on4.port);
+    try wire.name.expectText("host-d.local", on3.host);
+    try wire.name.expectText("host-d.local", on4.host);
+    // Both responders kept answering (no known-answer suppression) and
+    // none of those refreshes re-emitted.
+    try testing.expect(r.ra.stats.responses_sent >= 3);
+    try testing.expect(r.rb.stats.responses_sent >= 3);
+    try r.runTo(20 * s_us);
+    try r.sink.expectCount(.resolved, 2);
+    try r.sink.expectCount(.found, 2);
+    try r.sink.expectCount(.lost, 0);
+    // Two copies of each of the four records (PTR, SRV, TXT, A): one
+    // per interface.
+    try testing.expectEqual(@as(usize, 8), r.e.cacheCount());
+}
+
+test "lost fires per interface" {
+    // A goodbye is heard on the interface where the responder withdraws
+    // (RFC 6762 section 10.1); it removes that interface's copy only, so
+    // `lost` carries that interface and the other interface's instance
+    // is untouched (no new `found` / `resolved`, no `lost`). Before the
+    // fix the merged PTR was gone after the first goodbye and the second
+    // interface never reported a loss.
+    var r = try MultiRig.init(52);
+    defer r.deinit();
+    _ = try r.e.browse(svc_type, 0);
+    try r.runTo(3 * s_us);
+    try r.sink.expectCount(.resolved, 2);
+    const events_before = r.sink.items().len;
+
+    try r.rb.goodbye(&r.lan, 0, r.sc.nowUs());
+    try r.runTo(5 * s_us);
+    try r.sink.expectCount(.lost, 1);
+    try testing.expectEqual(@as(u32, 4), r.sink.last(.lost).?.lost.ifindex);
+    try wire.name.expectText("demo._qmsg._udp.local", r.sink.last(.lost).?.lost.instance);
+    try testing.expectEqual(@as(usize, 1), r.countOn(.lost, 4));
+    try testing.expectEqual(@as(usize, 0), r.countOn(.lost, 3));
+    // Nothing else moved: the interface-3 instance is still resolved
+    // with its own address and emitted nothing new.
+    try testing.expectEqual(events_before + 1, r.sink.items().len);
+    try r.sink.expectCount(.resolved, 2);
+    try r.sink.expectCount(.found, 2);
+    // Only interface 3's four records remain (the goodbye put interface
+    // 4's copies into their 1 s grace, now over).
+    try testing.expectEqual(@as(usize, 4), r.e.cacheCount());
+
+    try r.ra.goodbye(&r.lan, 0, r.sc.nowUs());
+    try r.runTo(7 * s_us);
+    try r.sink.expectCount(.lost, 2);
+    try testing.expectEqual(@as(u32, 3), r.sink.last(.lost).?.lost.ifindex);
+    try testing.expectEqual(@as(usize, 1), r.countOn(.lost, 3));
+    try testing.expectEqual(@as(usize, 0), r.e.cacheCount());
+    try r.sink.expectCount(.resolved, 2);
+}
+
+test "interface removal drops its cached records and emits lost" {
+    // An interface that leaves the table takes its cache scope with it
+    // (the per-interface key means nothing could refresh those records:
+    // no answer arrives with that ifindex again, and the surviving
+    // interface's answers land in their own key). The Engine drops them
+    // through the expiry path at `setInterfaces`: one `lost` for the
+    // removed interface's instance, right after `interfaces_changed`,
+    // the other interface's four records untouched, and nothing more for
+    // 10 s (no late `lost` when the orphan PTR would have expired, no
+    // requery marks for it).
+    var r = try MultiRig.init(54);
+    defer r.deinit();
+    _ = try r.e.browse(svc_type, 0);
+    try r.runTo(3 * s_us);
+    try r.sink.expectCount(.resolved, 2);
+    try testing.expectEqual(@as(usize, 8), r.e.cacheCount());
+    const events_before = r.sink.items().len;
+
+    try r.lan.setInterfaces(0, &.{fake_lan.iface4(3, "en0", .{ 10, 0, 3, 1 }, 24)}, &.{0}, r.sc.nowUs());
+    _ = try r.sink.drain(&r.e);
+    try testing.expectEqual(events_before + 2, r.sink.items().len);
+    try testing.expectEqual(mdns.Event.interfaces_changed, r.sink.items()[events_before]);
+    try r.sink.expectCount(.lost, 1);
+    try testing.expectEqual(@as(u32, 4), r.sink.last(.lost).?.lost.ifindex);
+    try wire.name.expectText("demo._qmsg._udp.local", r.sink.last(.lost).?.lost.instance);
+    try testing.expectEqual(@as(usize, 4), r.e.cacheCount());
+    try testing.expectEqual(@as(usize, 1), r.e.querier.instanceCount());
+
+    try r.runTo(13 * s_us);
+    try testing.expectEqual(events_before + 2, r.sink.items().len);
+    try r.sink.expectCount(.lost, 1);
+    try r.sink.expectCount(.resolved, 2);
+    try testing.expectEqual(@as(usize, 4), r.e.cacheCount());
+    try testing.expectEqual(@as(u32, 3), r.resolvedOn(3).?.ifindex);
+    // Nothing went out on interface 4 after the removal.
+    for (r.lan.sentLog()) |sent| {
+        if (sent.now_us > 3 * s_us) try testing.expectEqual(@as(u32, 3), sent.ifindex);
+    }
+}
+
+test "follow-ups for an instance found on one interface stay on that interface" {
+    // A PTR-only answer heard on interface 3 makes the instance need
+    // SRV / TXT follow-ups; they are scoped to interface 3 (RFC 6762
+    // section 14: the instance was found there), so the packets on
+    // interface 4 carry only the browse's PTR question, and the
+    // follow-up budget does not multiply with the interface count.
+    var sc: Scenario = .init(55);
+    var e = try Engine.init(testing.allocator, .{ .host_label = "fu", .random = sc.random() });
+    defer e.deinit();
+    var sink: Sink = .init(testing.allocator);
+    defer sink.deinit();
+    var lan: Lan = .init(testing.allocator);
+    defer lan.deinit();
+    _ = try lan.addEngine(&e, &.{
+        fake_lan.iface4(3, "en0", .{ 10, 0, 3, 1 }, 24),
+        fake_lan.iface4(4, "en1", .{ 10, 0, 4, 1 }, 24),
+    }, &.{ 0, 1 }, 0);
+    _ = try e.browse(svc_type, 0);
+    var buf: [1500]u8 = undefined;
+    var p: Packet = .response(&buf);
+    try p.ptr(svc_type, "alice", 4500);
+    _ = try lan.injectForeign(0, p.bytes(), .{ .ip4 = .{ .bytes = .{ 10, 0, 3, 9 }, .port = 5353 } }, true, 0);
+    _ = try sink.drain(&e);
+    try sink.expectCount(.found, 1);
+    try testing.expectEqual(@as(u32, 3), sink.last(.found).?.found.ifindex);
+
+    try lan.runToDeadlines(0, 30 * s_us, 250_000);
+    var ptr_on: [2]usize = .{ 0, 0 };
+    var followups_on: [2]usize = .{ 0, 0 };
+    for (lan.sentLog()) |sent| {
+        if (sent.kind != .query) continue;
+        const slot: usize = switch (sent.ifindex) {
+            3 => 0,
+            4 => 1,
+            else => return error.UnexpectedInterface,
+        };
+        const msg = try wire.Message.parse(sent.bytes);
+        var qs = msg.questions();
+        while (qs.next()) |q| switch (q.qtype) {
+            .ptr => ptr_on[slot] += 1,
+            .srv, .txt => followups_on[slot] += 1,
+            else => return error.UnexpectedQuestion,
+        };
+    }
+    try testing.expect(ptr_on[0] >= 5 and ptr_on[1] >= 5); // the browse ladder on both
+    try testing.expect(followups_on[0] >= 2 * 5); // SRV and TXT, ladder on interface 3
+    try testing.expectEqual(@as(usize, 0), followups_on[1]);
+}
+
+test "bridged segments report the same responder once per interface" {
+    // Two interfaces of one querier on ONE segment (a bridge, plan
+    // section 4.8 "Bridged echo"): the responder's one answer arrives on
+    // both interfaces and the querier reports it twice, with identical
+    // addresses, exactly as `dns-sd -B` lists a row per interfaceIndex.
+    // Duplicates are the correct per-interface result, not a merge.
+    var sc: Scenario = .init(53);
+    var e = try Engine.init(testing.allocator, .{ .host_label = "br", .random = sc.random() });
+    defer e.deinit();
+    var sink: Sink = .init(testing.allocator);
+    defer sink.deinit();
+    var lan: Lan = .init(testing.allocator);
+    defer lan.deinit();
+    _ = try lan.addEngine(&e, &.{
+        fake_lan.iface4(3, "en0", .{ 10, 0, 3, 1 }, 24),
+        fake_lan.iface4(4, "en1", .{ 10, 0, 3, 2 }, 24),
+    }, &.{ 0, 0 }, 0);
+    var responder: FakeResponder = .init(0, .{ 10, 0, 3, 7 }, 7, &multi_table_a, .{});
+    _ = try e.browse(svc_type, 0);
+    const Ctx = struct {
+        e: *Engine,
+        sink: *Sink,
+        fn drain(ctx: *anyopaque, _: u64) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            _ = try c.sink.drain(c.e);
+        }
+    };
+    var ctx: Ctx = .{ .e = &e, .sink = &sink };
+    try fake_responder.run(&lan, &.{&responder}, 0, 5 * s_us, 10_000, .{ .ctx = &ctx, .f = Ctx.drain });
+    try sink.expectCount(.found, 2);
+    try sink.expectCount(.resolved, 2);
+    var seen3 = false;
+    var seen4 = false;
+    for (sink.items()) |ev| switch (ev) {
+        .resolved => |res| {
+            try testing.expectEqual(@as(usize, 1), res.addrs.len);
+            try testing.expectEqual([4]u8{ 10, 0, 3, 7 }, res.addrs.slice()[0].ip4.bytes);
+            if (res.ifindex == 3) seen3 = true;
+            if (res.ifindex == 4) seen4 = true;
+        },
+        else => {},
+    };
+    try testing.expect(seen3 and seen4);
+}

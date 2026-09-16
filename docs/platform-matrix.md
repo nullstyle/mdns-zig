@@ -116,7 +116,7 @@ accepts the numbers regardless of the macro; we hard-code the 3542 set.
 | Destination address (RFC 6762 §11 and the QU window) | `IP_PKTINFO` (`ipi_addr`), `IPV6_PKTINFO` (`ipi6_addr`); decoded on 104/104 datagrams in the M0 spike | `IP_PKTINFO`, `IPV6_PKTINFO`; 100 % in the M2 runs | `IP_RECVDSTADDR`, `IPV6_PKTINFO` (unverified) | `IP_RECVDSTADDR`, `IPV6_PKTINFO` (unverified) |
 | Datagram without a destination cmsg (option silently ineffective, `MSG_CTRUNC`) | `Service` counts it in `RxCounters.no_dst` and hands it to the Engine with `dst_known = false`: the §11 on-link check still runs as for a unicast destination, the QU-window drop (`dropped_unicast_unexpected`) does not, and `Engine.stats().rx_dst_unknown` counts it. Without this every multicast response on such a socket would be dropped and a browse would die with nothing but counters to show for it. | same | same | same |
 | `std.posix.IP` under dev.1786 | `void`: hard-code, no cross-check | present: comptime assert against `std.os.linux.IP`/`IPV6`/`SO`/`SOL`/`IFF` (`socket_opts.zig`, `comptime` block) | present: the table reads `std.c.IP`/`IPV6`/`SO` and the same `comptime` block pins them to the plan section 9 numbers (`RECVIF 20`, `RECVTTL 65`, `RECVPKTINFO 36`, `PKTINFO 46`, `HOPLIMIT 47`, ...) | present: same, pinned to `RECVIF 30`, `RECVTTL 31`, `RECVPKTINFO 36`, `PKTINFO 46`, `HOPLIMIT 47` |
-| Io backends | Threaded (gate, fds left BLOCKING: `BindOptions.nonblocking = false`, see "Known risks"); Dispatch on the fork (M6, needs `O_NONBLOCK`) | Threaded (gate, blocking fds); Uring on the fork (M6) | Threaded (blocking fds); Kqueue on the fork (M6) | Threaded (blocking fds); Kqueue on the fork (M6) |
+| Io backends | Threaded (gate, fds BLOCKING except inside the send window, see "Darwin send path" under "Known risks"); Dispatch on the fork (M6, needs `O_NONBLOCK`) | Threaded (gate, blocking fds); Uring on the fork (M6) | Threaded (blocking fds); Kqueue on the fork (M6) | Threaded (blocking fds); Kqueue on the fork (M6) |
 | Local Network privacy | macOS 15+: GUI-launched processes may be blocked silently; Terminal, SSH and root are allowed | n/a | n/a | n/a |
 | Test host | this Mac | Lima `zig-uring` (cross-built `aarch64-linux-musl`, run in M2) | Lima `kq-freebsd` (M6, best effort) | none |
 | Unverified | `Clock.boot` for the wake heuristic; Evented Io construction API; whether Darwin `udp_input` can ever report a readable socket whose datagram then vanishes (not observed, see "Known risks") | glibc `ifaddrs` layout (`x86_64-linux-gnu` compiles, only musl ran); `IP_RECVTTL`/`IPV6_HOPLIMIT` cmsg values (delivered, not printed by `mdns-live`); the bad-checksum spurious-readiness behaviour of `udp_poll` on a blocking vs `O_NONBLOCK` fd (read from net/ipv4/udp.c, not exercised) | every constant on hardware (every header cited in the tables above is on disk in the pinned toolchain and matches the code; nothing was run) | every constant on hardware (headers on disk and matching the code; nothing was run) |
@@ -360,6 +360,75 @@ test that injects a bad-checksum UDP datagram (raw socket in Lima) and
 asserts no trap is the acceptance test for whichever option lands.
 
 `README.md` and `CHANGELOG.md` carry the same bullet under "Known risks".
+
+**Darwin send path: `MSG_DONTWAIT` does not bound a datagram send
+(M3 gate hang, fixed).** `zig build live -- --seconds 3` with the default
+interface set (17 interfaces incl. `utun*`, `bridge*`, `awdl0`, `llw0`)
+once sat forever inside the first `sendmsg` of a query round while
+`dns-sd -R` ran; every subset of interfaces worked. Root cause, from
+xnu (apple-oss-distributions main, `bsd/kern/uipc_socket.c`
+`sosendcheck`): when `sbspace(&so->so_snd) < resid` a datagram send
+returns `EWOULDBLOCK` only for `SS_NBIO` (the fd's `O_NONBLOCK`) or the
+kernel-private `MSG_NBIO` (0x20000, `sys/socket_private.h`); userland
+`MSG_DONTWAIT` (0x80) is consulted only by `SBLOCKWAIT` and by the
+receive paths, so a blocking-fd send goes to `sbwait`. `sbspace`
+(`uipc_socket2.c`) subtracts the bytes a content filter still holds for a
+verdict (`cfil_sock_data_space`, `net.cfil`), and this Mac runs three
+NetworkExtension filters (Little Snitch, Tailscale, Clawpatrol;
+`systemextensionsctl list`, `sysctl net.cfil.active_count` = 1). A fresh
+multicast flow per (interface, family) is a new verdict each, and one the
+filter never answers (a dead `utun`, an "ask" rule nobody clicks) is a
+send that never returns. `Io.Threaded`'s timed send tries
+`MSG_DONTWAIT` first and only polls afterwards (`Threaded.zig:2853`,
+`:12970`), so its 2 ms timeout cannot fire when that first call sleeps;
+neither hypothesis (a) v6 on an addressless interface, (b) `SO_SNDBUF`
+exhaustion nor (c) `lo0` v6 reproduced it (about 80 default-set runs
+plus per-interface probes with a full `utun0` output queue, every send
+under 1.2 ms).
+
+Fix (`socket_opts.send_window_needs_nonblock`, `service.zig`
+`openSendWindow` / `closeSendWindow`): on Darwin the Service sets
+`O_NONBLOCK` on both sockets for the duration of one send batch and
+clears it before the next receive (single thread, `defer`-guarded, also
+around a lone `sendDatagram`). A short buffer is then `EWOULDBLOCK` ->
+`poll(POLLOUT)` bounded by `send_timeout_us` -> `error.Timeout` -> a
+counted drop (`stats().tx_dropped`, `txCounters().timeouts`). To keep the
+post-poll `operate` send (Threaded.zig:2573, `WouldBlock => unreachable`)
+from ever seeing `EWOULDBLOCK`, `bindMdnsSocket` raises `SO_SNDLOWAT` to
+`SO_SNDBUF` (`raise_send_lowat`): `POLLOUT` (`sowriteable`: `sbspace >=
+sb_lowat`) then means the whole buffer is free, so any datagram that
+passed the `EMSGSIZE` check (`resid <= sb_hiwat`) fits, and nothing else
+sends on the socket between the poll and the send. The receive path is
+unchanged: the fd is blocking again before every receive, so the Linux
+`udp_poll` argument above still holds. Linux honours `MSG_DONTWAIT` for
+the send-buffer wait (`sock_sndtimeo(sk, flags & MSG_DONTWAIT)`), FreeBSD
+(`sosend_generic`) and OpenBSD (`sosend`) too, so the window is a
+comptime no-op there and the fds stay blocking throughout.
+`txCounters()` reports `timeouts`, `slow` (sends over `send_timeout_us`
+of wall time, which the timed call did not bound) and `max_us`;
+`mdns-live` prints them on its `tx` line. Tests: `send window sets
+O_NONBLOCK only while sending`, `send window flag toggles O_NONBLOCK and
+restores it`, `bound mDNS socket has its send low-water mark raised to
+the send buffer`, `egress skips a joined pair whose interface has no
+address of that family`. A kernel-level block cannot be staged from a
+unit test (UDP `sb_cc` stays 0 without a filter); the live default-set
+run beside `dns-sd -R` completed in 3.3 s, 3 of 3 runs, `tx timeouts=0
+slow=0 max_us<=332`. The window is opened lazily by the first datagram
+of a batch (`txCounters().window_opened` counts the batches), so an idle
+step costs no `fcntl`.
+
+One send errno class is not a counted drop: `Io.Threaded` maps
+`EINVAL`, `EOPNOTSUPP`, `EDESTADDRREQ`, `EISCONN`, `EFAULT`, `ENOTSOCK`
+and `EBADF` from `sendmsg` to `errnoBug` (Threaded.zig:13083-13089),
+which panics in Debug builds and is `error.Unexpected` (a counted drop)
+in ReleaseSafe. xnu answers an `IP_PKTINFO` / `IPV6_PKTINFO` control
+message naming an unusable interface with `ENXIO` / `EADDRNOTAVAIL`
+(`ip_output` / `ip6_output` via `in6_selectsrc`), never `EINVAL`, and
+the Engine only builds a datagram for a joined pair whose interface has
+an address of that family (`joinedPairs`, and `pollDatagram` re-checks
+the pair when it drains, so a job queued before an interface left the
+table is a counted `tx_dropped` rather than a send). That filter is the
+guard; there is no assert on the send path.
 
 **Coarse errno typing on group membership (fixed).** `setsockoptChecked`
 now maps `EADDRINUSE` -> `error.AddressInUse`, `EADDRNOTAVAIL` ->

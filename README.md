@@ -66,6 +66,22 @@ timings", "Known risks").
   (M6) needs `O_NONBLOCK` and must add a mitigation first. Details and
   the options in docs/platform-matrix.md, "Known risks and decisions for
   M2".
+- **Darwin ignores `MSG_DONTWAIT` for datagram sends.** xnu's
+  `sosendcheck` blocks a blocking-fd `sendmsg` whenever the send buffer is
+  short, and a content filter (Little Snitch, Tailscale, MDM agents) can
+  keep it short for as long as it holds a flow for a verdict, so the
+  Service sets `O_NONBLOCK` around each send batch on Darwin only (the
+  "send window") and clears it before every receive; a send the kernel
+  will not take within 2 ms is a counted drop. Details in
+  docs/platform-matrix.md, "Darwin send path".
+- **Per-interface cache.** Records are keyed by `(name, type, class,
+  ifindex)`; a responder heard on k interfaces costs k copies of each
+  record, and `found` / `resolved` / `lost` fire once per interface (as
+  `dns-sd -B` does; `Service.lookup` collapses them to one slot per
+  instance). An interface that leaves the table drops its records
+  (`lost` for its instances). Size `Limits.max_cache_records` (default
+  4096, 720 B each) as interfaces x records per instance (about 5) x
+  instances.
 
 ## Platforms and Io backends
 

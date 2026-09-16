@@ -911,18 +911,107 @@ pub fn closeFd(fd: Handle) void {
 
 /// Set O_NONBLOCK through `fcntl(F_GETFL/F_SETFL)`.
 pub fn setNonBlocking(fd: Handle) std.Io.UnexpectedError!void {
+    return setNonBlockingFlag(fd, true);
+}
+
+/// Set or clear O_NONBLOCK through `fcntl(F_GETFL/F_SETFL)`. The
+/// Service opens a "send window" with it on Darwin (`send_window_needs_nonblock`)
+/// and closes it again before any receive.
+pub fn setNonBlockingFlag(fd: Handle, on: bool) std.Io.UnexpectedError!void {
     const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
     switch (c.errno(flags)) {
         .SUCCESS => {},
         else => |err| return posix.unexpectedErrno(err),
     }
-    const Backing = @typeInfo(posix.O).@"struct".backing_integer.?;
-    const nonblock: Backing = @bitCast(posix.O{ .NONBLOCK = true });
-    const new_flags: c_int = @bitCast(@as(u32, @bitCast(flags)) | @as(u32, nonblock));
+    const nonblock = nonblockBit();
+    const cur: u32 = @bitCast(flags);
+    const want: u32 = if (on) cur | nonblock else cur & ~nonblock;
+    if (want == cur) return;
+    const new_flags: c_int = @bitCast(want);
     switch (c.errno(c.fcntl(fd, c.F.SETFL, new_flags))) {
         .SUCCESS => {},
         else => |err| return posix.unexpectedErrno(err),
     }
+}
+
+/// Whether O_NONBLOCK is set on `fd` (tests and the send window's
+/// self-check).
+pub fn isNonBlocking(fd: Handle) std.Io.UnexpectedError!bool {
+    const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+    switch (c.errno(flags)) {
+        .SUCCESS => {},
+        else => |err| return posix.unexpectedErrno(err),
+    }
+    return (@as(u32, @bitCast(flags)) & nonblockBit()) != 0;
+}
+
+fn nonblockBit() u32 {
+    const Backing = @typeInfo(posix.O).@"struct".backing_integer.?;
+    const bit: Backing = @bitCast(posix.O{ .NONBLOCK = true });
+    return @as(u32, bit);
+}
+
+/// True where a `sendmsg(2)` on a BLOCKING fd can sleep even with
+/// `MSG_DONTWAIT`, so the Service must set O_NONBLOCK on the socket for
+/// the duration of each send batch (the "send window") and clear it again
+/// before the next receive.
+///
+/// XNU (`bsd/kern/uipc_socket.c` `sosendcheck`, apple-oss-distributions
+/// main): when `sbspace(&so->so_snd) < resid` the send returns
+/// `EWOULDBLOCK` only for `SS_NBIO` (the fd's O_NONBLOCK) or the
+/// kernel-private `MSG_NBIO` (0x20000); `MSG_DONTWAIT` (0x80) is consulted
+/// only by `SBLOCKWAIT` and by the receive paths, so it does NOT keep a
+/// blocking-fd datagram send out of `sbwait`. `sbspace` subtracts the
+/// bytes a content filter (`net.cfil`, NetworkExtension
+/// NEFilterDataProvider: Little Snitch, Tailscale, MDM agents) still holds
+/// for a verdict (`cfil_sock_data_space`), so with a filter attached a UDP
+/// send on a fresh (interface, group) flow can sleep in the kernel until
+/// the filter answers, which for a flow the filter never decides is
+/// forever. `Io.Threaded`'s timed send tries `MSG_DONTWAIT` first and only
+/// polls afterwards, so its timeout cannot fire when that first call
+/// sleeps (Threaded.zig:2853, :12970). Linux honours `MSG_DONTWAIT` for
+/// the send-buffer wait (`sock_sndtimeo(sk, flags & MSG_DONTWAIT)`), and
+/// so do FreeBSD (`sosend_generic`) and OpenBSD (`sosend`): there the
+/// window is not needed and the fd stays blocking throughout.
+pub const send_window_needs_nonblock = is_darwin;
+
+/// With the send window open, `Io.Threaded` maps an `EWOULDBLOCK` from
+/// the first `sendmsg` to a `poll(POLLOUT)` bounded by the send timeout,
+/// then one more `sendmsg` through `operate`, whose `WouldBlock` is
+/// `unreachable` (Threaded.zig:2573). `POLLOUT` means `sbspace >=
+/// sb_lowat` (XNU `sowriteable`), while the send needs `sbspace >= len`,
+/// so with the default `sb_lowat` (MCLBYTES = 2048) a datagram larger than
+/// 2 KB could poll ready and still not fit. Raising `SO_SNDLOWAT` to
+/// `SO_SNDBUF` (XNU clamps it to `sb_hiwat`) makes `POLLOUT` mean "the
+/// whole buffer is free", so any datagram that passed the `EMSGSIZE`
+/// check fits, and the post-poll send cannot block or fail with
+/// `EWOULDBLOCK` on a single-threaded socket. `bindMdnsSocket` applies it
+/// where the send window is used.
+pub const raise_send_lowat = send_window_needs_nonblock;
+
+/// Darwin `sys/socket.h:155` SO_SNDBUF and `:157` SO_SNDLOWAT.
+const darwin_so_sndbuf: u32 = 0x1001;
+const darwin_so_sndlowat: u32 = 0x1003;
+
+/// `getsockopt` with a C `int` payload.
+pub fn getsockoptInt(fd: Handle, level: u32, optname: u32) SetsockoptError!c_int {
+    var value: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    const rc = c.getsockopt(fd, @intCast(level), optname, @ptrCast(&value), &len);
+    switch (c.errno(rc)) {
+        .SUCCESS => return value,
+        .INVAL, .NOPROTOOPT, .OPNOTSUPP => return error.OptionUnsupported,
+        .BADF, .NOTSOCK, .FAULT => return error.Unexpected,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+/// Set `SO_SNDLOWAT` to the socket's `SO_SNDBUF` (see `raise_send_lowat`).
+/// Returns the low-water mark now in force.
+pub fn raiseSendLowat(fd: Handle) SetsockoptError!c_int {
+    const sndbuf = try getsockoptInt(fd, consts.sol_socket, darwin_so_sndbuf);
+    try setsockoptInt(fd, consts.sol_socket, darwin_so_sndlowat, sndbuf);
+    return getsockoptInt(fd, consts.sol_socket, darwin_so_sndlowat);
 }
 
 pub const BindError = error{
@@ -1189,6 +1278,7 @@ fn bindMdnsSocketInner(family: Family, opts: BindOptions) RawBindError!BoundSock
     }
 
     if (opts.nonblocking) try setNonBlocking(fd);
+    if (comptime raise_send_lowat) _ = try raiseSendLowat(fd);
 
     try bindWildcard(fd, family, opts.port);
 
@@ -1799,4 +1889,47 @@ test "bindMdnsSocket on an ephemeral port: options apply and first_binder is tru
         error.AddressUnavailable, error.NoInterface, error.OptionUnsupported => {},
         else => |e| return e,
     };
+}
+
+test "send window flag toggles O_NONBLOCK and restores it" {
+    // The Service's send window (`service.zig` `openSendWindow`) relies on
+    // this pair: set, observe, clear, observe; a no-op set or clear must
+    // not fail.
+    const fd = rawUdpSocket(.v4) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    defer closeFd(fd);
+    try testing.expect(!try isNonBlocking(fd));
+    try setNonBlockingFlag(fd, true);
+    try testing.expect(try isNonBlocking(fd));
+    try setNonBlockingFlag(fd, true);
+    try testing.expect(try isNonBlocking(fd));
+    try setNonBlockingFlag(fd, false);
+    try testing.expect(!try isNonBlocking(fd));
+    try setNonBlockingFlag(fd, false);
+    try testing.expect(!try isNonBlocking(fd));
+}
+
+test "bound mDNS socket has its send low-water mark raised to the send buffer" {
+    // `raise_send_lowat` (Darwin): after `bindMdnsSocket`, POLLOUT must
+    // mean the whole send buffer is free, so the post-poll send of a
+    // timed `sendManyTimeout` cannot block (fd blocking) or hit
+    // Threaded's `WouldBlock => unreachable` (fd non-blocking). On the
+    // other platforms the option is left alone and this only checks
+    // that the bind still works and the fd is blocking.
+    const b4 = bindMdnsSocket(.v4, .{ .port = 0 }) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    defer closeFd(b4.socket.handle);
+    try testing.expect(!try isNonBlocking(b4.socket.handle));
+    if (comptime raise_send_lowat) {
+        const sndbuf = try getsockoptInt(b4.socket.handle, consts.sol_socket, darwin_so_sndbuf);
+        const lowat = try getsockoptInt(b4.socket.handle, consts.sol_socket, darwin_so_sndlowat);
+        try testing.expect(sndbuf > 0);
+        try testing.expectEqual(sndbuf, lowat);
+        // Setting it again is idempotent.
+        try testing.expectEqual(sndbuf, try raiseSendLowat(b4.socket.handle));
+    }
 }

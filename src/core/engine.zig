@@ -237,13 +237,30 @@ pub const Engine = struct {
     /// A family with at least one address starts as joined (see
     /// `setJoined`); joined flags of interfaces already in the table are
     /// carried over. An added interface restarts every browse ladder so
-    /// the new link hears our questions (M4 adds probing there).
+    /// the new link hears our questions (M4 adds probing there). A
+    /// removed interface takes its cache scope with it: every record
+    /// heard on it is dropped through the expiry path (`lost` for its
+    /// browsed instances, after `.interfaces_changed`), because the
+    /// per-interface cache key means nothing could ever refresh them.
     pub fn setInterfaces(e: *Engine, ifs: []const Interface, now_us: u64) SetInterfacesError!void {
         if (ifs.len > e.ifaces.len) return error.LimitReached;
 
         var changed = ifs.len != e.ifaces_len;
         var added = false;
         var new_joined: [max_pairs / 2]Joined = @splat(.{});
+        var removed: [max_pairs / 2]u32 = undefined;
+        var removed_len: usize = 0;
+        for (e.ifaces[0..e.ifaces_len]) |*old| {
+            var kept = false;
+            for (ifs) |*n| if (n.index == old.index) {
+                kept = true;
+                break;
+            };
+            if (!kept) {
+                removed[removed_len] = old.index;
+                removed_len += 1;
+            }
+        }
         // Pass 1 reads the old table: drops, warnings, change detection
         // and the joined flags. Pass 2 overwrites it.
         var i: usize = 0;
@@ -271,6 +288,7 @@ pub const Engine = struct {
         e.ifaces_len = ifs.len;
         @memcpy(e.joined[0..ifs.len], new_joined[0..ifs.len]);
         if (changed) e.pushEvent(.interfaces_changed);
+        for (removed[0..removed_len]) |ifindex| e.querier.dropInterface(ifindex, e.sink());
         if (added) e.querier.restartSchedules(now_us);
     }
 
@@ -531,8 +549,17 @@ pub const Engine = struct {
     /// are QM with ID 0 (RFC 6762 section 18.1), to 224.0.0.251:5353 or
     /// [ff02::fb]:5353 with the egress interface as the v6 scope; every
     /// sent datagram is recorded in the echo ring.
+    ///
+    /// A job queued by `tick` for a pair that is no longer joined (its
+    /// interface left the table or lost its membership between the tick
+    /// and this drain) is not sent: it is a counted `tx_dropped`, so the
+    /// platform never sees a pktinfo naming an interface it does not
+    /// have.
     pub fn pollDatagram(e: *Engine, buf: []u8, now_us: u64) ?TxDatagram {
-        const built = e.querier.buildNext(buf, now_us) orelse return null;
+        const built = while (e.querier.buildNext(buf, now_us)) |b| {
+            if (e.isJoined(b.pair.ifindex, b.pair.family)) break b;
+            e.counters.tx_dropped += 1;
+        } else return null;
         e.echoes.record(buf[0..built.len], now_us);
         e.counters.tx += 1;
         return .{
@@ -719,6 +746,69 @@ test "engine joined pairs default to families with an address and follow setJoin
     try testing.expectEqual(Family.v4, joined[0].family);
     try testing.expectEqual(@as(u32, 5), joined[1].ifindex);
     try testing.expectEqual(Family.v6, joined[1].family);
+}
+
+test "egress skips a joined pair whose interface has no address of that family" {
+    // The pure egress-filter decision behind `tick` / `pollDatagram`: a
+    // datagram goes out on (ifindex, family) only when the Service
+    // reported the join AND the interface holds an address of that
+    // family (Revision 5 item 1). Neither alone is enough: a stale
+    // `setJoined(true)` on an addressless family (a v6 join that
+    // succeeded before the address went away, or Linux `lo` v6) must
+    // not produce a send, and an address without a join must not either.
+    var e = try testEngine(.{ .max_interfaces = 4 });
+    defer e.deinit();
+    try e.setInterfaces(&.{ testIface(3, 1, 0), testIface(4, 0, 1), testIface(5, 1, 1) }, 0);
+    // Force the "joined but addressless" state the filter must reject.
+    e.setJoined(3, .v6, true);
+    e.setJoined(4, .v4, true);
+    // And the "address but no join" state.
+    e.setJoined(5, .v6, false);
+    var pairs: [Engine.max_pairs]querier_mod.Pair = undefined;
+    const joined = e.joinedPairs(&pairs);
+    try testing.expectEqual(@as(usize, 3), joined.len);
+    try testing.expectEqual(@as(u32, 3), joined[0].ifindex);
+    try testing.expectEqual(Family.v4, joined[0].family);
+    try testing.expectEqual(@as(u32, 4), joined[1].ifindex);
+    try testing.expectEqual(Family.v6, joined[1].family);
+    try testing.expectEqual(@as(u32, 5), joined[2].ifindex);
+    try testing.expectEqual(Family.v4, joined[2].family);
+    // No interfaces at all: nothing to send on.
+    try e.setInterfaces(&.{}, 1);
+    try testing.expectEqual(@as(usize, 0), e.joinedPairs(&pairs).len);
+}
+
+test "pollDatagram drops a queued job for a pair that is no longer joined" {
+    // A tick queues one job per joined pair; when a pair loses its
+    // membership (or its interface leaves the table) before the drain,
+    // the built packet is not handed out: it is a counted `tx_dropped`,
+    // so the platform never gets a pktinfo for an interface it no longer
+    // has. The other pair's packet still goes out.
+    var e = try testEngine(.{ .max_interfaces = 4 });
+    defer e.deinit();
+    try e.setInterfaces(&.{ testIface(3, 1, 0), testIface(4, 1, 0) }, 0);
+    _ = try e.browse("_qmsg._udp", 0);
+    const first = e.nextDeadline(0).?;
+    e.tick(first);
+    e.setJoined(4, .v4, false);
+    var buf: [1500]u8 = undefined;
+    const d = e.pollDatagram(&buf, first).?;
+    try testing.expectEqual(@as(u32, 3), d.ifindex);
+    try testing.expectEqual(null, e.pollDatagram(&buf, first));
+    try testing.expectEqual(@as(u64, 1), e.stats().tx);
+    try testing.expectEqual(@as(u64, 1), e.stats().tx_dropped);
+    // The same for an interface that left the table between tick and drain.
+    const second = e.nextDeadline(first).?;
+    e.tick(second);
+    try e.setInterfaces(&.{testIface(4, 1, 0)}, second);
+    e.setJoined(4, .v4, true);
+    var sent: usize = 0;
+    while (e.pollDatagram(&buf, second)) |dg| {
+        sent += 1;
+        try testing.expectEqual(@as(u32, 4), dg.ifindex);
+    }
+    try testing.expectEqual(@as(usize, 0), sent); // only 3's job was queued (4 was unjoined at the tick)
+    try testing.expectEqual(@as(u64, 2), e.stats().tx_dropped);
 }
 
 test "engine on-link check uses the arrival interface prefixes" {

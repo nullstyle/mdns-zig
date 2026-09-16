@@ -17,23 +17,34 @@
 //!   random 0-2 % (RFC 6762 section 5.2). Browse queries are QM, never QU
 //!   (section 5.4; plan section 4.8 "QU policy").
 //! - The **cache** (`core/cache.zig`) keys records by `(name, type,
-//!   class)`, so the order of records inside a packet does not matter.
-//!   `handleResponse` harvests every answer and additional record first,
-//!   then runs the resolve join for every instance the packet touched
-//!   (plan section 4.5).
-//! - An **instance** is a PTR target of a browsed type. `found` fires
-//!   when its PTR enters the cache, `lost` when the PTR leaves it (expiry,
-//!   or one second after a goodbye, section 10.1). A PTR for a type
-//!   without an active browse is cached and emits nothing (hashicorp/mdns
-//!   #96), so a later browse of that type starts warm.
+//!   class, ifindex)`, so the order of records inside a packet does not
+//!   matter and what one interface hears never flushes what another
+//!   heard (RFC 6762 sections 6.2, 14). `handleResponse` harvests every
+//!   answer and additional record first, then runs the resolve join for
+//!   every instance the packet touched (plan section 4.5).
+//! - An **instance** is a PTR target of a browsed type **on one
+//!   interface**: the same service heard on two interfaces is two
+//!   instances, as with `dns-sd -B` (one row per interfaceIndex).
+//!   `found` fires when its PTR enters the cache, `lost` when the PTR
+//!   leaves it (expiry, or one second after a goodbye, section 10.1),
+//!   each carrying the interface. A PTR for a type without an active
+//!   browse is cached and emits nothing (hashicorp/mdns #96), so a later
+//!   browse of that type starts warm. An interface that leaves the table
+//!   takes its records and instances with it (`dropInterface`: `lost`
+//!   for each browsed instance heard there).
 //! - `resolved` fires when the instance's SRV, TXT and at least one
-//!   address of the SRV target are live in the cache, again whenever the
-//!   SRV rdata, the TXT rdata or the address set changes, and never for a
-//!   refresh that carries the same data. `ttl_s` is the shortest
-//!   remaining TTL among the records that built the value.
+//!   address of the SRV target are live in the cache **on the instance's
+//!   interface**, again whenever the SRV rdata, the TXT rdata or that
+//!   interface's address set changes, and never for a refresh that
+//!   carries the same data. `Resolved.addrs` holds exactly the addresses
+//!   the responder gave on that interface (section 6.2). `ttl_s` is the
+//!   shortest remaining TTL among the records that built the value.
 //! - A found instance that lacks SRV, TXT or an address gets **follow-up
 //!   questions** (SRV + TXT, then A + AAAA for the SRV target) on their
-//!   own section 5.2 ladder. They stop when the instance resolves.
+//!   own section 5.2 ladder, sent only on the instance's interface
+//!   (`Question.ifindex`; requery marks are scoped the same way, browse
+//!   PTR questions go to every joined pair). They stop when the
+//!   instance resolves.
 //! - Records a local client cares about get **requery marks** at 80, 85,
 //!   90 and 95 % of their TTL (+0-2 %); a due mark folds its question
 //!   into the next query packet. Nothing else is ever re-queried (section
@@ -111,13 +122,23 @@ pub const Sink = struct {
 
 // ---- state -----------------------------------------------------------
 
-/// One question (class IN) due for the next query packet.
+/// One question (class IN) due for the next query packet. `ifindex`
+/// scopes it to one interface's jobs (a follow-up for an instance found
+/// there, a requery mark of a record heard there); null goes out on
+/// every joined pair (a browse's PTR question).
 pub const Question = struct {
     name: Name,
     rtype: RType,
+    ifindex: ?u32 = null,
 
+    /// Same name and type (the interface is not part of it).
     pub fn eql(a: *const Question, b: *const Question) bool {
         return a.rtype == b.rtype and a.name.eql(&b.name);
+    }
+
+    /// Does this question go out on `ifindex`'s pairs?
+    pub fn appliesTo(q: *const Question, ifindex: u32) bool {
+        return q.ifindex == null or q.ifindex.? == ifindex;
     }
 };
 
@@ -135,15 +156,19 @@ pub const Browse = struct {
     interval_us: u64 = 0,
 };
 
-/// One found service instance: the resolve state behind `found`,
-/// `lost`, `resolved` and the follow-up questions. The instance name is
-/// the rdata of the PTR entry at `ptr_index`; the state lives exactly as
-/// long as that entry (it is freed in the expiry callback, and browsed
-/// PTRs are pinned against eviction).
+/// One found service instance on one interface: the resolve state
+/// behind `found`, `lost`, `resolved` and the follow-up questions. The
+/// instance name is the rdata of the PTR entry at `ptr_index` and the
+/// interface is that entry's; the state lives exactly as long as that
+/// entry (it is freed in the expiry callback, and browsed PTRs are pinned
+/// against eviction). Identity is (instance name, ifindex).
 pub const Instance = struct {
     used: bool = false,
     /// Cache pool index of the PTR entry whose rdata names this instance.
     ptr_index: u32 = none,
+    /// Arrival interface of that PTR: every record the join reads for
+    /// this instance is looked up on it.
+    ifindex: u32 = 0,
     /// `Name.hash` of the instance name (bucket key).
     name_hash: u64 = 0,
     /// `Name.hash` of the SRV target once an SRV was seen (A/AAAA
@@ -430,13 +455,13 @@ pub const Querier = struct {
         return inst;
     }
 
-    /// The instance named `name`, or null.
-    fn instanceByName(q: *Querier, name: *const Name) ?*Instance {
+    /// The instance named `name` on `ifindex`, or null.
+    fn instanceByName(q: *Querier, name: *const Name, ifindex: u32) ?*Instance {
         const h = name.hash();
         var i = q.inst_buckets[q.bucketOfHash(h)];
         while (i != none) : (i = q.instances[i].next_in_bucket) {
             const inst = &q.instances[i];
-            if (inst.name_hash != h) continue;
+            if (inst.name_hash != h or inst.ifindex != ifindex) continue;
             const n = q.instanceName(inst) orelse continue;
             if (n.eql(name)) return inst;
         }
@@ -467,6 +492,7 @@ pub const Querier = struct {
         q.instances[i] = .{
             .used = true,
             .ptr_index = ptr_index,
+            .ifindex = e.ifindex,
             .name_hash = h,
             .next_in_bucket = q.inst_buckets[b],
         };
@@ -478,20 +504,20 @@ pub const Querier = struct {
 
     /// Drop the resolve state at `index` and the pins on the records it
     /// consumed (its SRV/TXT, and its host's A/AAAA unless another
-    /// instance lives on that host). The PTR entry must still be linked
-    /// (it is, in every caller: expiry and eviction callbacks run before
-    /// the unlink, `stopBrowse` walks live entries).
+    /// instance on the same interface lives on that host). The PTR entry
+    /// must still be linked (it is, in every caller: expiry and eviction
+    /// callbacks run before the unlink, `stopBrowse` walks live entries).
     fn freeInstance(q: *Querier, index: u32) void {
         const inst = &q.instances[index];
         if (!inst.used) return;
         if (q.instanceName(inst)) |name| {
-            q.unpinAll(&name, .srv);
-            q.unpinAll(&name, .txt);
-            if (q.liveSrv(&name)) |s| {
+            q.unpinAllOn(&name, .srv, inst.ifindex);
+            q.unpinAllOn(&name, .txt, inst.ifindex);
+            if (q.liveSrv(&name, inst.ifindex)) |s| {
                 q.setHost(inst, null);
-                if (!q.anyHostHash(s.srv.target.hash())) {
-                    q.unpinAll(&s.srv.target, .a);
-                    q.unpinAll(&s.srv.target, .aaaa);
+                if (!q.anyHostOn(s.srv.target.hash(), inst.ifindex)) {
+                    q.unpinAllOn(&s.srv.target, .a, inst.ifindex);
+                    q.unpinAllOn(&s.srv.target, .aaaa, inst.ifindex);
                 }
             }
         }
@@ -544,9 +570,10 @@ pub const Querier = struct {
         }
     }
 
-    /// Clear the eviction pin on every entry of one RRSet.
-    fn unpinAll(q: *Querier, name: *const Name, rtype: RType) void {
-        var it = q.cache.lookup(name, rtype, wire.class_in);
+    /// Clear the eviction pin on every entry of one RRSet on one
+    /// interface.
+    fn unpinAllOn(q: *Querier, name: *const Name, rtype: RType, ifindex: u32) void {
+        var it = q.cache.lookupOn(name, rtype, wire.class_in, ifindex);
         while (it.next()) |e| e.flags.pinned = false;
     }
 
@@ -554,18 +581,18 @@ pub const Querier = struct {
         return q.inst_used;
     }
 
-    /// Mark every instance whose SRV target is `host` dirty. Returns true
-    /// when at least one matched.
-    fn dirtyByHost(q: *Querier, host: *const Name) bool {
+    /// Mark every instance on `ifindex` whose SRV target is `host` dirty.
+    /// Returns true when at least one matched.
+    fn dirtyByHost(q: *Querier, host: *const Name, ifindex: u32) bool {
         const h = host.hash();
         var any = false;
         var i = q.host_buckets[q.bucketOfHash(h)];
         while (i != none) : (i = q.instances[i].next_in_host_bucket) {
             const inst = &q.instances[i];
-            if (inst.host_hash != h) continue;
+            if (inst.host_hash != h or inst.ifindex != ifindex) continue;
             // Hash match; confirm through the live SRV target.
             const name = q.instanceName(inst) orelse continue;
-            const srv = q.liveSrv(&name) orelse continue;
+            const srv = q.liveSrv(&name, inst.ifindex) orelse continue;
             if (!srv.srv.target.eql(host)) continue;
             inst.dirty = true;
             any = true;
@@ -573,11 +600,13 @@ pub const Querier = struct {
         return any;
     }
 
-    /// Whether any instance's SRV target hashes to `h` (host chain walk).
-    fn anyHostHash(q: *const Querier, h: u64) bool {
+    /// Whether any instance on `ifindex` has an SRV target hashing to `h`
+    /// (host chain walk).
+    fn anyHostOn(q: *const Querier, h: u64, ifindex: u32) bool {
         var i = q.host_buckets[q.bucketOfHash(h)];
         while (i != none) : (i = q.instances[i].next_in_host_bucket) {
-            if (q.instances[i].host_hash == h) return true;
+            const inst = &q.instances[i];
+            if (inst.host_hash == h and inst.ifindex == ifindex) return true;
         }
         return false;
     }
@@ -658,7 +687,7 @@ pub const Querier = struct {
                 return inst != null;
             },
             .srv, .txt => {
-                const inst = q.instanceByName(&rec.name) orelse return false;
+                const inst = q.instanceByName(&rec.name, ifindex) orelse return false;
                 inst.dirty = true;
                 if (e.isLive()) {
                     inst.followups_suppressed = false;
@@ -671,7 +700,7 @@ pub const Querier = struct {
                 return true;
             },
             .a, .aaaa => {
-                if (!q.dirtyByHost(&rec.name)) return false;
+                if (!q.dirtyByHost(&rec.name, ifindex)) return false;
                 if (e.isLive()) e.flags.pinned = true; // provisional, see above
                 return true;
             },
@@ -696,8 +725,8 @@ pub const Querier = struct {
     fn caredAbout(q: *Querier, e: *const Entry) bool {
         return switch (e.rtype) {
             .ptr => q.findBrowse(&e.name) != null,
-            .srv, .txt => q.instanceByName(&e.name) != null,
-            .a, .aaaa => q.anyHostHash(e.name.hash()),
+            .srv, .txt => q.instanceByName(&e.name, e.ifindex) != null,
+            .a, .aaaa => q.anyHostOn(e.name.hash(), e.ifindex),
             else => false,
         };
     }
@@ -712,8 +741,8 @@ pub const Querier = struct {
 
     const LiveSrv = struct { entry: *Entry, srv: wire.Srv };
 
-    fn liveSrv(q: *Querier, instance: *const Name) ?LiveSrv {
-        var it = q.cache.lookup(instance, .srv, wire.class_in);
+    fn liveSrv(q: *Querier, instance: *const Name, ifindex: u32) ?LiveSrv {
+        var it = q.cache.lookupOn(instance, .srv, wire.class_in, ifindex);
         while (it.next()) |e| {
             if (!e.isLive()) continue;
             const rd = e.rdataSlice();
@@ -729,18 +758,18 @@ pub const Querier = struct {
         return null;
     }
 
-    fn liveFirst(q: *Querier, name: *const Name, rtype: RType) ?*Entry {
-        var it = q.cache.lookup(name, rtype, wire.class_in);
+    fn liveFirst(q: *Querier, name: *const Name, rtype: RType, ifindex: u32) ?*Entry {
+        var it = q.cache.lookupOn(name, rtype, wire.class_in, ifindex);
         while (it.next()) |e| {
             if (e.isLive()) return e;
         }
         return null;
     }
 
-    /// A goodbye (section 10.1) for `(name, rtype)` is in its grace
-    /// second.
-    fn hasGoodbye(q: *Querier, name: *const Name, rtype: RType) bool {
-        var it = q.cache.lookup(name, rtype, wire.class_in);
+    /// A goodbye (section 10.1) for `(name, rtype)` on `ifindex` is in
+    /// its grace second.
+    fn hasGoodbye(q: *Querier, name: *const Name, rtype: RType, ifindex: u32) bool {
+        var it = q.cache.lookupOn(name, rtype, wire.class_in, ifindex);
         while (it.next()) |e| {
             if (e.flags.goodbye_pending) return true;
         }
@@ -758,15 +787,18 @@ pub const Querier = struct {
     /// The plan section 5 "resolved re-emit rule" for one instance. Also
     /// the one place that decides which records a client cares about:
     /// the SRV, TXT and addresses it reads get their pins and requery
-    /// marks here, whatever order they arrived in.
+    /// marks here, whatever order they arrived in. Every lookup is on
+    /// the instance's interface: the join never mixes what two
+    /// interfaces heard.
     fn join(q: *Querier, inst: *Instance, now_us: u64, sink: Sink) void {
         const name = q.instanceName(inst) orelse return;
-        const srv = q.liveSrv(&name);
-        const txt = q.liveFirst(&name, .txt);
+        const ifindex = inst.ifindex;
+        const srv = q.liveSrv(&name, ifindex);
+        const txt = q.liveFirst(&name, .txt, ifindex);
         // Pins follow the join: the consumed SRV / TXT keep theirs, every
         // other member of the RRSet (a second SRV, junk) loses it.
-        q.unpinAll(&name, .srv);
-        q.unpinAll(&name, .txt);
+        q.unpinAllOn(&name, .srv, ifindex);
+        q.unpinAllOn(&name, .txt, ifindex);
         var addrs: events.Bounded(Io.net.IpAddress, events.max_resolved_addrs) = .{};
         var addr_digest: u64 = 0;
         var min_ttl: u32 = std.math.maxInt(u32);
@@ -774,7 +806,7 @@ pub const Querier = struct {
             q.setHost(inst, s.srv.target.hash());
             q.careAbout(s.entry, now_us);
             min_ttl = @min(min_ttl, s.entry.remainingTtlS(now_us));
-            q.collectAddrs(&s.srv.target, s.srv.port, now_us, &addrs, &addr_digest, &min_ttl);
+            q.collectAddrs(&s.srv.target, s.srv.port, ifindex, now_us, &addrs, &addr_digest, &min_ttl);
         }
         if (txt) |t| {
             q.careAbout(t, now_us);
@@ -787,7 +819,7 @@ pub const Querier = struct {
             // responder said goodbye to the PTR or to the missing SRV/TXT
             // (section 10.1): asking again would be pointless.
             const ptr_live = if (q.ptrEntry(inst)) |pe| pe.isLive() else false;
-            if (!ptr_live or (srv == null and q.hasGoodbye(&name, .srv)) or (txt == null and q.hasGoodbye(&name, .txt))) {
+            if (!ptr_live or (srv == null and q.hasGoodbye(&name, .srv, ifindex)) or (txt == null and q.hasGoodbye(&name, .txt, ifindex))) {
                 inst.followups_suppressed = true;
             }
             if (inst.followups_suppressed) {
@@ -822,30 +854,31 @@ pub const Querier = struct {
             .port = s.srv.port,
             .addrs = addrs,
             .txt = txt_value,
-            .ifindex = s.entry.ifindex,
+            .ifindex = ifindex,
             .ttl_s = if (min_ttl == std.math.maxInt(u32)) 0 else min_ttl,
         } });
     }
 
-    /// Every live A then AAAA of `host` (at most 8 per family, plan
-    /// section 4.8) as `IpAddress` values with `port`; link-local v6
-    /// carries the record's arrival interface (RFC 6762 section 15, plan
-    /// section 5). Each listed record is pinned and gets its requery
-    /// marks. The digest is order-independent (a wrapping sum of
-    /// per-address hashes).
+    /// Every live A then AAAA of `host` heard on `ifindex` (at most 8 per
+    /// family, plan section 4.8) as `IpAddress` values with `port`;
+    /// link-local v6 carries the record's arrival interface (RFC 6762
+    /// section 15, plan section 5). Each listed record is pinned and gets
+    /// its requery marks. The digest is order-independent (a wrapping sum
+    /// of per-address hashes).
     fn collectAddrs(
         q: *Querier,
         host: *const Name,
         port: u16,
+        ifindex: u32,
         now_us: u64,
         addrs: *events.Bounded(Io.net.IpAddress, events.max_resolved_addrs),
         digest: *u64,
         min_ttl: *u32,
     ) void {
-        q.unpinAll(host, .a);
-        q.unpinAll(host, .aaaa);
+        q.unpinAllOn(host, .a, ifindex);
+        q.unpinAllOn(host, .aaaa, ifindex);
         var n4: usize = 0;
-        var it4 = q.cache.lookup(host, .a, wire.class_in);
+        var it4 = q.cache.lookupOn(host, .a, wire.class_in, ifindex);
         while (it4.next()) |e| {
             if (n4 == events.max_addrs_per_family) break;
             if (!e.isLive() or e.rdata_len != 4) continue;
@@ -857,7 +890,7 @@ pub const Querier = struct {
             min_ttl.* = @min(min_ttl.*, e.remainingTtlS(now_us));
         }
         var n6: usize = 0;
-        var it6 = q.cache.lookup(host, .aaaa, wire.class_in);
+        var it6 = q.cache.lookupOn(host, .aaaa, wire.class_in, ifindex);
         while (it6.next()) |e| {
             if (n6 == events.max_addrs_per_family) break;
             if (!e.isLive() or e.rdata_len != 16) continue;
@@ -914,7 +947,7 @@ pub const Querier = struct {
                     e.flags.pinned = false;
                     return;
                 }
-                if (!ctx.q.addDue(.{ .name = e.name, .rtype = e.rtype })) {
+                if (!ctx.q.addDue(.{ .name = e.name, .rtype = e.rtype, .ifindex = e.ifindex })) {
                     // Batch full: keep this mark for the next tick.
                     e.next_requery_us = ctx.now_us;
                     return;
@@ -950,28 +983,33 @@ pub const Querier = struct {
     }
 
     /// Queue the SRV / TXT / A / AAAA questions a found instance still
-    /// needs. Null when it needs none (or its ladder is suppressed by a
-    /// goodbye); otherwise whether every one of them fit the batch (a
-    /// partial fit retries whole at the next tick).
+    /// needs on its interface. Null when it needs none (or its ladder is
+    /// suppressed by a goodbye); otherwise whether every one of them fit
+    /// the batch (a partial fit retries whole at the next tick). The
+    /// questions are scoped to the instance's interface (`buildNext`
+    /// leaves them out of the other pairs' packets): an instance heard
+    /// on one link is resolved on that link, and its follow-ups do not
+    /// multiply with the interface count.
     fn addFollowups(q: *Querier, inst: *Instance) ?bool {
         if (inst.followups_suppressed) return null;
         const name = q.instanceName(inst) orelse return null;
+        const ifindex = inst.ifindex;
         var needed = false;
         var all_queued = true;
-        const srv = q.liveSrv(&name);
+        const srv = q.liveSrv(&name, ifindex);
         if (srv == null) {
             needed = true;
-            if (!q.addDue(.{ .name = name, .rtype = .srv })) all_queued = false;
+            if (!q.addDue(.{ .name = name, .rtype = .srv, .ifindex = ifindex })) all_queued = false;
         }
-        if (q.liveFirst(&name, .txt) == null) {
+        if (q.liveFirst(&name, .txt, ifindex) == null) {
             needed = true;
-            if (!q.addDue(.{ .name = name, .rtype = .txt })) all_queued = false;
+            if (!q.addDue(.{ .name = name, .rtype = .txt, .ifindex = ifindex })) all_queued = false;
         }
         if (srv) |s| {
-            if (q.liveFirst(&s.srv.target, .a) == null and q.liveFirst(&s.srv.target, .aaaa) == null) {
+            if (q.liveFirst(&s.srv.target, .a, ifindex) == null and q.liveFirst(&s.srv.target, .aaaa, ifindex) == null) {
                 needed = true;
-                if (!q.addDue(.{ .name = s.srv.target, .rtype = .a })) all_queued = false;
-                if (!q.addDue(.{ .name = s.srv.target, .rtype = .aaaa })) all_queued = false;
+                if (!q.addDue(.{ .name = s.srv.target, .rtype = .a, .ifindex = ifindex })) all_queued = false;
+                if (!q.addDue(.{ .name = s.srv.target, .rtype = .aaaa, .ifindex = ifindex })) all_queued = false;
             }
         }
         if (!needed) return null;
@@ -979,10 +1017,17 @@ pub const Querier = struct {
     }
 
     /// Queue a question for the next packet. True when it is in the
-    /// batch (already there counts); false when the batch is full, which
-    /// is counted in `questions_deferred`.
+    /// batch (already there counts: the same question for every pair, or
+    /// for this one); false when the batch is full, which is counted in
+    /// `questions_deferred`. Two entries for the same question on
+    /// different interfaces can coexist, and an every-pair entry beside
+    /// an interface-scoped one: `buildNext` encodes each question once
+    /// per packet.
     fn addDue(q: *Querier, question: Question) bool {
-        for (q.due[0..q.due_len]) |*d| if (d.eql(&question)) return true;
+        for (q.due[0..q.due_len]) |*d| {
+            if (!d.eql(&question)) continue;
+            if (d.ifindex == null or d.ifindex == question.ifindex) return true;
+        }
         if (q.due_len == q.due.len) {
             q.stats.questions_deferred += 1;
             return false;
@@ -1002,6 +1047,23 @@ pub const Querier = struct {
         }.cb);
     }
 
+    /// An interface left the table: drop every record heard on it and
+    /// the resolve state bound to it, through the expiry path (browsed
+    /// PTRs emit `lost{ifindex}`, instances are freed, pins go), so
+    /// nothing of a vanished interface lingers until its TTL, re-queries
+    /// on the surviving interfaces, or attaches to a reused index (RFC
+    /// 6762 section 14: results belong to the interface they were heard
+    /// on). Never allocates (one pool walk). The Engine calls it from
+    /// `setInterfaces`.
+    pub fn dropInterface(q: *Querier, ifindex: u32, sink: Sink) void {
+        _ = q.cache.expireInterface(ifindex, ExpireCtx{ .q = q, .sink = sink }, struct {
+            fn cb(ctx: ExpireCtx, e: *const Entry) void {
+                ctx.q.onExpired(e, ctx.sink);
+            }
+        }.cb);
+        q.recomputeDeadline();
+    }
+
     /// Called for each entry about to leave the cache, by expiry or by
     /// eviction (it is still linked, so lookups must not rely on it being
     /// gone).
@@ -1015,9 +1077,9 @@ pub const Querier = struct {
                 sink.push(.{ .lost = .{ .instance = instance, .service_type = e.name, .ifindex = e.ifindex } });
             },
             .srv, .txt => {
-                if (q.instanceByName(&e.name)) |inst| inst.dirty = true;
+                if (q.instanceByName(&e.name, e.ifindex)) |inst| inst.dirty = true;
             },
-            .a, .aaaa => _ = q.dirtyByHost(&e.name),
+            .a, .aaaa => _ = q.dirtyByHost(&e.name, e.ifindex),
             else => {},
         }
     }
@@ -1069,9 +1131,14 @@ pub const Querier = struct {
             } });
             b.setId(0);
 
-            // Questions (section 5.3: as many as fit).
+            // Questions (section 5.3: as many as fit), those for this
+            // pair's interface only, each once.
             while (job.q_pos < q.due_len) {
                 const d = &q.due[job.q_pos];
+                if (!d.appliesTo(job.pair.ifindex) or q.dueBefore(job.q_pos, job.pair.ifindex)) {
+                    job.q_pos += 1;
+                    continue;
+                }
                 b.addQuestion(d.name, d.rtype, wire.class_in, false) catch |err| switch (err) {
                     error.NoSpace => {
                         if (b.questionCount() != 0) break;
@@ -1091,7 +1158,7 @@ pub const Querier = struct {
             if (!more) {
                 while (job.ka_pos < q.cache.entries.len) {
                     const e = &q.cache.entries[job.ka_pos];
-                    if (!q.isKnownAnswer(e, now_us)) {
+                    if (!q.isKnownAnswer(e, now_us, job.pair.ifindex)) {
                         job.ka_pos += 1;
                         continue;
                     }
@@ -1130,19 +1197,36 @@ pub const Querier = struct {
         return null;
     }
 
+    /// Is the question at `pos` already covered, for `ifindex`'s packet,
+    /// by an earlier due entry (same name and type, applying to that
+    /// interface)? Keeps a per-interface requery mark and an every-pair
+    /// browse question from appearing twice in one packet.
+    fn dueBefore(q: *const Querier, pos: usize, ifindex: u32) bool {
+        const d = &q.due[pos];
+        for (q.due[0..pos]) |*earlier| {
+            if (earlier.appliesTo(ifindex) and earlier.eql(d)) return true;
+        }
+        return false;
+    }
+
     fn popJob(q: *Querier) void {
         q.jobs_head = (q.jobs_head + 1) % q.jobs.len;
         q.jobs_len -= 1;
         if (q.jobs_len == 0) q.due_len = 0;
     }
 
-    /// RFC 6762 section 7.1: a cached live record that answers one of the
-    /// due questions and is not yet past half its TTL.
-    fn isKnownAnswer(q: *const Querier, e: *const Entry, now_us: u64) bool {
+    /// RFC 6762 section 7.1: a cached live record heard on `ifindex` that
+    /// answers one of the due questions and is not yet past half its TTL.
+    /// Records heard on other interfaces are not listed: a responder on
+    /// this link has not necessarily given them, and listing them would
+    /// suppress its answer (section 7.1) until the record passes half
+    /// its TTL.
+    fn isKnownAnswer(q: *const Querier, e: *const Entry, now_us: u64, ifindex: u32) bool {
         if (!e.used or !e.isLive() or e.class != wire.class_in) return false;
+        if (e.ifindex != ifindex) return false;
         if (e.pastHalfTtl(now_us)) return false;
         for (q.due[0..q.due_len]) |*d| {
-            if (d.rtype == e.rtype and d.name.eql(&e.name)) return true;
+            if (d.appliesTo(ifindex) and d.rtype == e.rtype and d.name.eql(&e.name)) return true;
         }
         return false;
     }
@@ -1193,15 +1277,18 @@ test "KA half-TTL filter" {
     const r = q.cache.upsert(.{ .name = name, .rtype = .ptr, .class = wire.class_in, .ttl_s = 100, .rdata = rd[0..n], .ifindex = 1 }, 0, false, .none);
     const e = q.cache.entryAt(r.index.?);
     // No due question: never a known answer.
-    try testing.expect(!q.isKnownAnswer(e, 10));
+    try testing.expect(!q.isKnownAnswer(e, 10, 1));
     _ = q.addDue(.{ .name = name, .rtype = .ptr });
-    try testing.expect(q.isKnownAnswer(e, 10));
-    try testing.expect(q.isKnownAnswer(e, timers.s(49)));
-    try testing.expect(!q.isKnownAnswer(e, timers.s(50)));
+    try testing.expect(q.isKnownAnswer(e, 10, 1));
+    try testing.expect(q.isKnownAnswer(e, timers.s(49), 1));
+    try testing.expect(!q.isKnownAnswer(e, timers.s(50), 1));
+    // A record heard on interface 1 is not a known answer for a query
+    // going out on interface 2.
+    try testing.expect(!q.isKnownAnswer(e, 10, 2));
     // A different type is not an answer to a PTR question.
     q.due_len = 0;
     _ = q.addDue(.{ .name = name, .rtype = .srv });
-    try testing.expect(!q.isKnownAnswer(e, 10));
+    try testing.expect(!q.isKnownAnswer(e, 10, 1));
 }
 
 test "resolve-join decision emits once and again on change" {

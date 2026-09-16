@@ -198,17 +198,23 @@ pub const Family = enum(u8) {
 
 // ---- events ----------------------------------------------------------
 
-/// A fully resolved service instance (plan section 5, "resolved re-emit
-/// rule").
+/// A fully resolved service instance on one interface (plan section 5,
+/// "resolved re-emit rule"). A multi-homed responder yields one value per
+/// interface it answered on, each with that interface's addresses, like
+/// `dns-sd -B` / `DNSServiceResolve` per interfaceIndex.
 pub const Resolved = struct {
     instance: Name,
     service_type: Name,
     host: Name,
     port: u16,
-    /// Every live A (at most 8) then AAAA (at most 8) of `host`. `fe80::`
-    /// entries carry `.ip6.interface = arrival ifindex`.
+    /// Every live A (at most 8) then AAAA (at most 8) of `host` learned
+    /// on `ifindex`: the responder MUST give only the addresses valid on
+    /// that interface (RFC 6762 section 6.2). `fe80::` entries carry
+    /// `.ip6.interface = ifindex`.
     addrs: Bounded(Io.net.IpAddress, max_resolved_addrs) = .{},
     txt: Txt = .{},
+    /// The interface the records were heard on; with `instance` it is
+    /// the identity of the result.
     ifindex: u32,
     /// Shortest remaining TTL among the SRV, TXT, A and AAAA records that
     /// built this value.
@@ -257,6 +263,8 @@ pub const Event = union(enum) {
     interfaces_changed: void,
     warning: Warning,
 
+    /// One per (instance, interface): a service heard on two interfaces
+    /// is found twice, and `lost` fires per interface too.
     pub const Found = struct { instance: Name, service_type: Name, ifindex: u32 };
     pub const Lost = struct { instance: Name, service_type: Name, ifindex: u32 };
     pub const Registered = struct { id: RegId, instance: Name };

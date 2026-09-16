@@ -228,6 +228,26 @@ pub fn FakeLan(comptime max_engines: usize) type {
             return lan.addEngine(engine, &.{iface}, &.{segment}, now_us);
         }
 
+        /// Replace an attached engine's interface table (interface `k`
+        /// on `segments[k]`), as a runtime interface change would, and
+        /// call `engine.setInterfaces(ifaces, now_us)`. Datagrams are
+        /// delivered to (and sent from) the new table only.
+        pub fn setInterfaces(lan: *Self, idx: usize, ifaces: []const Interface, segments: []const u32, now_us: u64) !void {
+            if (idx >= lan.nodes_len) return error.NoSuchEngine;
+            if (ifaces.len != segments.len) return error.SegmentCountMismatch;
+            if (ifaces.len > max_ifaces_per_engine) return error.LimitReached;
+            for (segments) |s| if (s >= max_segments) return error.SegmentOutOfRange;
+            for (ifaces, 0..) |*i, k| {
+                if (i.index == 0) return error.ZeroIfindex;
+                for (ifaces[0..k]) |*j| if (j.index == i.index) return error.DuplicateIfindex;
+            }
+            const n = &lan.nodes[idx];
+            try n.engine.setInterfaces(ifaces, now_us);
+            n.ifaces = .{};
+            n.ifaces.appendSlice(ifaces) catch unreachable; // len checked above
+            @memcpy(n.segments[0..segments.len], segments);
+        }
+
         pub fn node(lan: *Self, idx: usize) *Node {
             return &lan.nodes[idx];
         }

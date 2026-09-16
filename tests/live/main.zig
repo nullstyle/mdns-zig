@@ -16,6 +16,13 @@
 //! Flags: `--seconds N` (default 4), `--ifindex N` (repeatable; becomes
 //! the allow-list), `--browse TYPE`, `--no-ipv6`, `--no-loopback`.
 //!
+//! If a run ever hangs (the M3 gate saw one on macOS with a content
+//! filter attached; see `socket_opts.send_window_needs_nonblock`), take
+//! `sample <pid> 2 -file hang.txt` BEFORE killing it, and note the
+//! concurrent processes (another `zig build test` binding *:5353, a Lima
+//! VM starting, VPN or utun churn). The `tx ...` line reports sends that
+//! exceeded `send_timeout_us` (`slow`) and the longest one (`max_us`).
+//!
 //! Last line: `RESULT bind=OK first_binder=<bool> joined_v4=<n>
 //! joined_v6=<n> rx_v4_ifindex=<n> rx_v6_ifindex=<n> tx=<n>`; exit 0
 //! when the bind succeeded, 1 otherwise.
@@ -162,6 +169,10 @@ pub fn main(init: std.process.Init) !u8 {
     });
     try out.print("rx v4={d} v4_with_ifindex={d} v6={d} v6_with_ifindex={d} tolerated_errors={d} steps={d} step_errors={d}\n", .{
         rx.v4, rx.v4_with_ifindex, rx.v6, rx.v6_with_ifindex, rx.tolerated_errors, steps, step_errors,
+    });
+    const tx = svc.txCounters();
+    try out.print("tx timeouts={d} slow={d} max_us={d} window_failed={d} window_opened={d}\n", .{
+        tx.timeouts, tx.slow, tx.max_us, tx.window_failed, tx.window_opened,
     });
     try out.print("RESULT bind=OK first_binder={} joined_v4={d} joined_v6={d} rx_v4_ifindex={d} rx_v6_ifindex={d} tx={d}\n", .{
         svc.firstBinder(),

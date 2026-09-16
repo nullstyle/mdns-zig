@@ -16,7 +16,14 @@
 //!   through `recvTimed` / `sendTimed`, which accept a `Timed` value that
 //!   has no `.none` member, so an untimed call is a compile error. Sockets
 //!   are blocking fds; a zero-duration receive is a non-blocking drain
-//!   (`error.Timeout` = nothing to read).
+//!   (`error.Timeout` = nothing to read). Sends run inside a "send
+//!   window" (`openSendWindow`): on Darwin O_NONBLOCK is set on both
+//!   sockets for the duration of one send batch and cleared before the
+//!   next receive, because XNU ignores `MSG_DONTWAIT` for the send-buffer
+//!   wait and a content filter can hold that buffer for as long as it
+//!   likes (`socket_opts.send_window_needs_nonblock`). A send the kernel
+//!   will not take within `send_timeout_us` is a counted drop
+//!   (`txCounters().timeouts`, `stats().tx_dropped`), never a stall.
 //! - Batch buffers are allocated once at `init` (4.5): `[8]IncomingMessage`,
 //!   8 x 9000 B of data, control as `[8][control_size]u8 align(8)` (64 B;
 //!   128 B on FreeBSD and OpenBSD, whose `IP_RECVIF` cmsg set does not fit
@@ -368,6 +375,29 @@ pub const Service = struct {
         no_dst: u64 = 0,
     };
 
+    /// Send-side counters beside `stats().tx_dropped`, so a stalled or
+    /// slow send path is visible without a debugger (`mdns-live` prints
+    /// them).
+    pub const TxCounters = struct {
+        /// Sends that ended in `error.Timeout` (the kernel would not take
+        /// the datagram within `send_timeout_us`); a subset of
+        /// `tx_dropped`.
+        timeouts: u64 = 0,
+        /// Sends whose wall time exceeded `send_timeout_us` (the timed
+        /// send did not bound them: on Darwin that is the
+        /// `send_window_needs_nonblock` case).
+        slow: u64 = 0,
+        /// Longest single send so far, awake clock.
+        max_us: u64 = 0,
+        /// `fcntl` refused to open or close the send window (never
+        /// expected on a valid fd); the datagram of a failed open is
+        /// dropped rather than sent through a possibly blocking call.
+        window_failed: u64 = 0,
+        /// Times the send window was opened (one per send batch that had
+        /// a datagram; an idle step opens none). 0 off Darwin.
+        window_opened: u64 = 0,
+    };
+
     const PendingMutation = union(enum) {
         withdraw: RegId,
         stop_browse: BrowseId,
@@ -431,6 +461,9 @@ pub const Service = struct {
     tx_dropped: u64,
     mailbox_dropped: u64,
     rx: RxCounters,
+    tx: TxCounters,
+    /// O_NONBLOCK is set on the sockets right now (`openSendWindow`).
+    tx_window_open: bool,
     first_tx_us: ?u64,
     no_packets_warned: bool,
     events_dropped_warned: bool,
@@ -522,6 +555,8 @@ pub const Service = struct {
             .tx_dropped = 0,
             .mailbox_dropped = 0,
             .rx = .{},
+            .tx = .{},
+            .tx_window_open = false,
             .first_tx_us = null,
             .no_packets_warned = false,
             .events_dropped_warned = false,
@@ -748,6 +783,10 @@ pub const Service = struct {
 
     pub fn rxCounters(s: *const Service) RxCounters {
         return s.rx;
+    }
+
+    pub fn txCounters(s: *const Service) TxCounters {
+        return s.tx;
     }
 
     /// Forwards `Engine.nextDeadline`.
@@ -981,10 +1020,16 @@ pub const Service = struct {
     }
 
     /// Bounded one-shot lookup (mode B): browse, collect `resolved` into
-    /// `out` (a later `resolved` for the same instance replaces the
-    /// earlier copy), stop the browse on every exit path. Returns when
-    /// `out` is full, after `timeout_us`, or after `quiet_us` with at
-    /// least one result and no new `resolved`.
+    /// `out`, stop the browse on every exit path. One slot per instance
+    /// (plan section 5): a later `resolved` for the same instance
+    /// replaces the earlier copy, whichever interface it came from, so
+    /// a responder heard on k interfaces fills one slot with the
+    /// addresses of the interface that resolved it last (`Resolved.
+    /// ifindex` says which) and `out` sized by the expected instance
+    /// count is enough. The per-interface stream (one `resolved` per
+    /// interface) is what `browse` gives. Returns when `out` is full,
+    /// after `timeout_us`, or after `quiet_us` with at least one result
+    /// and no new `resolved`.
     pub fn lookup(s: *Service, service_type: []const u8, opts: LookupOptions, out: []Resolved) LookupError!usize {
         s.bindMode(.step);
         const start = s.nowUs();
@@ -1006,23 +1051,28 @@ pub const Service = struct {
                 if (n == 0) break;
                 for (buf[0..n]) |ev| {
                     if (ev != .resolved) continue;
-                    const r = ev.resolved;
-                    var slot: ?usize = null;
-                    for (out[0..count], 0..) |*o, i| {
-                        if (o.instance.eql(&r.instance) and o.service_type.eql(&r.service_type)) {
-                            slot = i;
-                            break;
-                        }
-                    }
-                    if (slot) |i| {
-                        out[i] = r;
-                    } else if (count < out.len) {
-                        out[count] = r;
-                        count += 1;
-                    }
+                    count = mergeResolved(out, count, ev.resolved);
                     last_new = s.nowUs();
                 }
             }
+        }
+        return count;
+    }
+
+    /// `lookup`'s collect rule: `r` replaces the slot of the same
+    /// instance (name and type, any interface) or takes the next free
+    /// one. Returns the new count. Pure, so it is unit-tested without a
+    /// socket.
+    fn mergeResolved(out: []Resolved, count: usize, r: Resolved) usize {
+        for (out[0..count]) |*o| {
+            if (o.instance.eql(&r.instance) and o.service_type.eql(&r.service_type)) {
+                o.* = r;
+                return count;
+            }
+        }
+        if (count < out.len) {
+            out[count] = r;
+            return count + 1;
         }
         return count;
     }
@@ -1122,18 +1172,89 @@ pub const Service = struct {
     /// next cancelation point ... will return error.Canceled"), so a
     /// `Group.cancel` that lands on the send must end the loop here or
     /// it is lost and `groupCancel` blocks forever.
+    ///
+    /// The send window is opened lazily on the first datagram, so an
+    /// idle step (nothing queued, the common case at the 250 ms cap)
+    /// costs no `fcntl` at all on Darwin.
     fn flushTx(s: *Service, now_us: u64) Io.Cancelable!void {
+        var opened = false;
+        defer if (opened) s.closeSendWindow();
         while (s.engine.pollDatagram(s.tx_buf, now_us)) |d| {
+            if (!opened) opened = s.openSendWindow();
             try s.sendDatagram(d);
         }
         if (s.first_tx_us == null and s.engine.stats().tx > 0) s.first_tx_us = now_us;
     }
 
+    // ---- send window -------------------------------------------------------
+    //
+    // On Darwin a datagram `sendmsg` on a blocking fd sleeps in the kernel
+    // whenever the send buffer is short of space, and `MSG_DONTWAIT` does
+    // not prevent it (`so.send_window_needs_nonblock` has the XNU
+    // citation). A content filter (Little Snitch, Tailscale, ...) holding a
+    // fresh multicast flow for a verdict is exactly that shortage, and it
+    // once hung `mdns-live` forever inside the first `sendmsg` of a query
+    // round over 17 interfaces. So every send batch runs with O_NONBLOCK
+    // set on both sockets: a short buffer is then `EWOULDBLOCK` -> a
+    // `poll(POLLOUT)` bounded by `send_timeout_us` -> `error.Timeout` -> a
+    // counted drop. The flag is cleared again before `flushTx` returns,
+    // because the receive path must stay a blocking fd (plan Revision 3:
+    // Threaded's post-poll `recvmsg` maps `WouldBlock => unreachable`, and
+    // Linux `udp_poll` hides bad-checksum datagrams only for blocking fds).
+    // Single-threaded, so the toggle needs no lock. On the other platforms
+    // `MSG_DONTWAIT` already keeps the first attempt out of the kernel
+    // wait and the window is a no-op.
+
+    /// Set O_NONBLOCK on both sockets for the sends that follow. Returns
+    /// whether this call opened the window (the caller closes it then).
+    /// A refused `fcntl` leaves the window closed and is counted; the
+    /// sends of that batch are dropped by `sendDatagram`.
+    fn openSendWindow(s: *Service) bool {
+        if (comptime !so.send_window_needs_nonblock) return false;
+        if (s.tx_window_open) return false;
+        for (s.socks[0..s.socks_len], 0..) |*sock, i| {
+            so.setNonBlockingFlag(sock.handle, true) catch {
+                s.tx.window_failed += 1;
+                // Undo the sockets already switched so no receive sees
+                // O_NONBLOCK.
+                for (s.socks[0..i]) |*done| so.setNonBlockingFlag(done.handle, false) catch {
+                    s.tx.window_failed += 1;
+                };
+                return false;
+            };
+        }
+        s.tx_window_open = true;
+        s.tx.window_opened += 1;
+        return true;
+    }
+
+    /// Clear O_NONBLOCK again. Must run before any receive.
+    fn closeSendWindow(s: *Service) void {
+        if (comptime !so.send_window_needs_nonblock) return;
+        if (!s.tx_window_open) return;
+        s.tx_window_open = false;
+        for (s.socks[0..s.socks_len]) |*sock| {
+            so.setNonBlockingFlag(sock.handle, false) catch {
+                s.tx.window_failed += 1;
+            };
+        }
+    }
+
     /// A cancelation point: `sendManyTimeout` returns `{ error.Canceled,
     /// 0 }` when the cancel lands before the first sendmsg
     /// (Threaded.zig:2855-2858) and that is the one send error that is
-    /// not a drop.
+    /// not a drop. Opens the send window itself when the caller did not
+    /// (`flushTx` opens it once per batch).
     fn sendDatagram(s: *Service, d: Engine.TxDatagram) Io.Cancelable!void {
+        const opened = s.openSendWindow();
+        defer if (opened) s.closeSendWindow();
+        if (comptime so.send_window_needs_nonblock) {
+            if (!s.tx_window_open) {
+                // `fcntl` refused: never hand the kernel a blocking send.
+                s.tx_dropped += 1;
+                return;
+            }
+        }
         const family: so.Family = switch (d.to) {
             .ip4 => .v4,
             .ip6 => .v6,
@@ -1168,9 +1289,18 @@ pub const Service = struct {
             .data_len = d.len,
             .control = control,
         }};
+        const started_us = s.nowUs();
         const err, const n = s.sendTimed(sock, &om, .micros(send_timeout_us));
+        const took_us = s.nowUs() -| started_us;
+        if (took_us > s.tx.max_us) s.tx.max_us = took_us;
+        if (took_us > send_timeout_us) s.tx.slow += 1;
         if (err) |e| switch (e) {
             error.Canceled => return error.Canceled,
+            error.Timeout => {
+                s.tx.timeouts += 1;
+                s.tx_dropped += 1;
+                return;
+            },
             else => {
                 s.tx_dropped += 1;
                 return;
@@ -1578,6 +1708,64 @@ test "send is a cancelation point and propagates Canceled" {
     try testing.expectEqual(@as(u64, 0), svc.stats().tx_dropped);
 }
 
+test "send window sets O_NONBLOCK only while sending" {
+    // P1 regression (M3 gate hang): on Darwin a blocking-fd datagram send
+    // can sleep in the kernel despite MSG_DONTWAIT
+    // (`so.send_window_needs_nonblock`), so every send batch runs with
+    // O_NONBLOCK set and clears it before the next receive. The window
+    // must be closed after `flushTx` / `sendDatagram` even when the send
+    // fails, so the blocking receive contract (plan Revision 3) holds.
+    var svc = try initUnjoinedOrSkip();
+    defer svc.deinit();
+    for (svc.socks[0..svc.socks_len]) |*sock| try testing.expect(!try so.isNonBlocking(sock.handle));
+    try testing.expect(!svc.tx_window_open);
+
+    const opened = svc.openSendWindow();
+    try testing.expectEqual(so.send_window_needs_nonblock, opened);
+    try testing.expectEqual(so.send_window_needs_nonblock, svc.tx_window_open);
+    for (svc.socks[0..svc.socks_len]) |*sock| {
+        try testing.expectEqual(so.send_window_needs_nonblock, try so.isNonBlocking(sock.handle));
+    }
+    // Re-opening is a no-op that does not take ownership of the close.
+    try testing.expect(!svc.openSendWindow());
+    svc.closeSendWindow();
+    try testing.expect(!svc.tx_window_open);
+    for (svc.socks[0..svc.socks_len]) |*sock| try testing.expect(!try so.isNonBlocking(sock.handle));
+
+    // A datagram to the v6 socket when only v4 is bound, or one larger
+    // than the buffer, is a counted drop; the window is closed after it.
+    const before = svc.tx_dropped;
+    try svc.sendDatagram(.{
+        .to = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9 } },
+        .len = svc.tx_buf.len + 1,
+        .ifindex = 0,
+    });
+    try testing.expectEqual(before + 1, svc.tx_dropped);
+    try testing.expect(!svc.tx_window_open);
+    for (svc.socks[0..svc.socks_len]) |*sock| try testing.expect(!try so.isNonBlocking(sock.handle));
+
+    // A real 1-byte send to the discard port on loopback goes through
+    // the timed send inside the window and leaves the fd blocking again;
+    // the wall time of that send is recorded.
+    svc.tx_buf[0] = 0;
+    try svc.sendDatagram(.{
+        .to = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9 } },
+        .len = 1,
+        .ifindex = 0,
+    });
+    try testing.expect(!svc.tx_window_open);
+    for (svc.socks[0..svc.socks_len]) |*sock| try testing.expect(!try so.isNonBlocking(sock.handle));
+    try testing.expectEqual(@as(u64, 0), svc.tx.window_failed);
+    try testing.expect(svc.tx.max_us < send_timeout_us or svc.tx.slow == 1);
+    // A flush with nothing queued never opens the window (no fcntl on
+    // an idle step): the fds stay blocking throughout.
+    const toggles_before = svc.tx.window_opened;
+    try svc.flushTx(svc.nowUs());
+    try testing.expect(!svc.tx_window_open);
+    try testing.expectEqual(toggles_before, svc.tx.window_opened);
+    for (svc.socks[0..svc.socks_len]) |*sock| try testing.expect(!try so.isNonBlocking(sock.handle));
+}
+
 test "serve backs off one step cap after a fatal step error" {
     // The policy `serve` applies to a non-Canceled `StepError`: count it
     // and sleep `max_step_cap_us` on the awake clock (a cancelation
@@ -1593,6 +1781,47 @@ test "serve backs off one step cap after a fatal step error" {
     // Threaded truncates to whole ms: at least 249 ms passed.
     try testing.expect(elapsed >= max_step_cap_us - 1_000);
     try testing.expectEqual(@as(u64, 0), svc.rxCounters().truncated);
+}
+
+test "lookup keeps one slot per instance across interfaces" {
+    // Plan section 5: "a second `resolved` for the same instance replaces
+    // the earlier copy". With the per-interface cache a multi-homed
+    // responder emits one `resolved` per interface; `lookup` collapses
+    // them into one slot (the last one wins, its `ifindex` says which
+    // link's addresses it carries), so `out` sized by the expected
+    // instance count cannot run out on a multi-homed querier. A second
+    // instance takes the next slot and a full `out` drops the rest.
+    const Name = @import("wire/root.zig").Name;
+    const demo = try Name.parse("demo._qmsg._udp.local");
+    const other = try Name.parse("other._qmsg._udp.local");
+    const stype = try Name.parse("_qmsg._udp.local");
+    const host = try Name.parse("host-d.local");
+    var on3: Resolved = .{ .instance = demo, .service_type = stype, .host = host, .port = 4433, .ifindex = 3, .ttl_s = 120 };
+    try on3.addrs.append(.{ .ip4 = .{ .bytes = .{ 10, 0, 3, 7 }, .port = 0 } });
+    var on4: Resolved = .{ .instance = demo, .service_type = stype, .host = host, .port = 4433, .ifindex = 4, .ttl_s = 120 };
+    try on4.addrs.append(.{ .ip4 = .{ .bytes = .{ 10, 0, 4, 7 }, .port = 0 } });
+    const second: Resolved = .{ .instance = other, .service_type = stype, .host = host, .port = 1, .ifindex = 3, .ttl_s = 120 };
+
+    var out: [2]Resolved = undefined;
+    var count: usize = 0;
+    count = Service.mergeResolved(&out, count, on3);
+    try testing.expectEqual(@as(usize, 1), count);
+    count = Service.mergeResolved(&out, count, on4);
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(u32, 4), out[0].ifindex);
+    try testing.expectEqual([4]u8{ 10, 0, 4, 7 }, out[0].addrs.slice()[0].ip4.bytes);
+    count = Service.mergeResolved(&out, count, second);
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(u16, 1), out[1].port);
+    // A re-emit on interface 3 replaces the same slot again.
+    count = Service.mergeResolved(&out, count, on3);
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(u32, 3), out[0].ifindex);
+    // Full: a third instance is dropped, the count is unchanged.
+    var third = second;
+    third.instance = try Name.parse("third._qmsg._udp.local");
+    count = Service.mergeResolved(&out, count, third);
+    try testing.expectEqual(@as(usize, 2), count);
 }
 
 test "mailbox put drops oldest after the cap and counts" {
