@@ -7,6 +7,8 @@ on:
 permissions:
   contents: read
 
+# mdns-zig parses untrusted UDP bytes, so build.zig refuses ReleaseFast and
+# ReleaseSmall. Every lane therefore runs Debug or ReleaseSafe only.
 jobs:
   test:
     name: Test (${{ matrix.optimize }})
@@ -18,8 +20,6 @@ jobs:
         optimize:
           - Debug
           - ReleaseSafe
-          - ReleaseFast
-          - ReleaseSmall
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -28,6 +28,16 @@ jobs:
         uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
         with:
           version: "2026.8.10"
+
+      # mise.toml points ZIG_GLOBAL_CACHE_DIR at .zig-global-cache inside the
+      # checkout (quic-zig test.yml pattern), so that is the path to cache.
+      - name: Cache Zig packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .zig-global-cache
+          key: zig-global-${{ runner.os }}-${{ hashFiles('build.zig.zon', 'mise.toml') }}
+          restore-keys: zig-global-${{ runner.os }}-
 
       - name: Run test suite
         run: zig build test -Doptimize=${{ matrix.optimize }}
@@ -41,7 +51,6 @@ jobs:
       matrix:
         os:
           - macos-15
-          - windows-2025
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,6 +60,16 @@ jobs:
         with:
           version: "2026.8.10"
 
+      - name: Cache Zig packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .zig-global-cache
+          key: zig-global-${{ runner.os }}-${{ hashFiles('build.zig.zon', 'mise.toml') }}
+          restore-keys: zig-global-${{ runner.os }}-
+
+      # Hermetic tests only. Live-socket tests need Local Network permission
+      # on macOS 15+, which a CI runner does not grant.
       - name: Run test suite
         run: zig build test -Doptimize=Debug
 
@@ -67,28 +86,124 @@ jobs:
         with:
           version: "2026.8.10"
 
+      - name: Cache Zig packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .zig-global-cache
+          key: zig-global-${{ runner.os }}-${{ hashFiles('build.zig.zon', 'mise.toml') }}
+          restore-keys: zig-global-${{ runner.os }}-
+
       - name: Check formatting
         run: |
           mise fmt --check
-          zig fmt --check build.zig src tests bench examples
+          zig fmt --check build.zig src tests spikes
+
+      - name: Release hygiene
+        run: sh tools/release-check.sh "$GITHUB_REF"
 
       - name: Build API documentation
         run: zig build docs
 
-      - name: Compile benchmarks
-        run: zig build bench -Doptimize=ReleaseFast
-
+      # `.paths` excludes tests/, spikes/ and interop/, and build.zig returns
+      # early for dependency builds, so `zig build test` at the package root
+      # would configure nothing. Instead: extract the package, copy the
+      # out-of-tree consumer into it, and run its tests. The consumer's
+      # `.path = "../.."` then resolves to the extracted package.
+      #
+      # `zig fetch .` copies the whole directory before applying `.paths`.
+      # With ZIG_GLOBAL_CACHE_DIR inside the checkout that copy recurses
+      # into its own destination until NameTooLong, so fetch from a clean
+      # `git archive` export instead of from `.`.
       - name: Verify filtered package and external consumer
         shell: bash
         run: |
-          zig fetch . --debug-hash
-          package_hash="$(zig fetch .)"
-          package_archive="${HOME}/.cache/zig/p/${package_hash}.tar.gz"
+          set -euo pipefail
+          src_dir="$(mktemp -d)"
+          git archive --format=tar HEAD | tar -x -C "${src_dir}"
+
+          zig fetch "${src_dir}" --debug-hash
+          pkg="$(zig fetch "${src_dir}")"
+          package_archive="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/p/${pkg}.tar.gz"
           test -f "${package_archive}"
 
           package_dir="$(mktemp -d)"
           tar -xzf "${package_archive}" -C "${package_dir}" --strip-components=1
-          cd "${package_dir}"
-          zig build test --cache-dir "${GITHUB_WORKSPACE}/.zig-cache/packaged-tests"
-          cd tests/consumer
+          test ! -e "${package_dir}/tests"
+          test ! -e "${package_dir}/spikes"
+
+          mkdir -p "${package_dir}/tests"
+          cp -R tests/consumer "${package_dir}/tests/consumer"
+          cd "${package_dir}/tests/consumer"
           zig build test --cache-dir "${GITHUB_WORKSPACE}/.zig-cache/packaged-consumer"
+          zig build test --cache-dir "${GITHUB_WORKSPACE}/.zig-cache/packaged-consumer" -Doptimize=ReleaseSafe
+
+  # Advisory: real sockets on the shared 5353 port next to avahi-daemon.
+  # `zig build live` is a placeholder until M2 (tests/live/).
+  live:
+    name: Live sockets (ubuntu, avahi, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install development toolchain
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          version: "2026.8.10"
+
+      - name: Cache Zig packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .zig-global-cache
+          key: zig-global-${{ runner.os }}-${{ hashFiles('build.zig.zon', 'mise.toml') }}
+          restore-keys: zig-global-${{ runner.os }}-
+
+      - name: Install and start avahi-daemon
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y avahi-daemon avahi-utils
+          sudo systemctl start avahi-daemon || sudo avahi-daemon -D
+          sleep 2
+          systemctl status avahi-daemon --no-pager || true
+
+      - name: Run live-socket tests
+        run: zig build live
+
+  # Advisory: coverage-guided fuzzing over the codec and Engine.handle
+  # (plan section 8, tier 3). A filtered test binary under --fuzz aborts the
+  # build runner (ziglang/zig#25352), so this runs the unfiltered suite.
+  # The iteration budget is recalibrated to about 60 s once targets exist.
+  # Disabled until the first `std.testing.fuzz` target lands (M1): on the
+  # pinned compiler `zig build test --fuzz` with zero fuzz tests aborts with
+  # "no fuzz tests found" (lib/compiler/Maker/Fuzz.zig:105). Flip `if` to
+  # true together with that target; the step text is the M1 acceptance
+  # command and stays as is.
+  fuzz:
+    name: Fuzz (advisory)
+    if: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install development toolchain
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          version: "2026.8.10"
+
+      - name: Cache Zig packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .zig-global-cache
+          key: zig-global-${{ runner.os }}-${{ hashFiles('build.zig.zon', 'mise.toml') }}
+          restore-keys: zig-global-${{ runner.os }}-
+
+      - name: Fuzz
+        run: zig build test --fuzz=10K

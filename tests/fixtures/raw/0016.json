@@ -1,0 +1,8 @@
+{
+  "source": "[fe80::14a4:fb8c:9851:a152]:5353",
+  "ifindex": 15,
+  "family": "v6",
+  "len": 73,
+  "captured_with": "spikes/join_pktinfo.zig",
+  "tool_running": "dns-sd -B _services._dns-sd._udp; dns-sd -R m0demo _mdnszig._udp . 4433 k=v"
+}

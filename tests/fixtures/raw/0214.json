@@ -1,0 +1,8 @@
+{
+  "source": "192.168.1.75:5353",
+  "ifindex": 15,
+  "family": "v4",
+  "len": 522,
+  "captured_with": "spikes/join_pktinfo.zig",
+  "tool_running": "dns-sd -R m0demo _mdnszig._udp . 4433 k=v (started 2 s before capture, killed at t+7 s); dns-sd -B _services._dns-sd._udp; dns-sd -L m0demo _mdnszig._udp"
+}
