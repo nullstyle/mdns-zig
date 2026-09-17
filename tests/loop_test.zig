@@ -327,7 +327,13 @@ test "mailbox drop emits warning.events_dropped once" {
     while (mailbox.next(io)) |ev| {
         if (ev == .warning and ev.warning == .events_dropped) warnings += 1 else others += 1;
     } else |err| try testing.expectEqual(error.Closed, err);
-    try testing.expectEqual(@as(usize, 1), warnings);
+    // The one-slot mailbox can evict the warning itself: any event that
+    // lands after it (an interface refresh on a busy host, as seen on the
+    // macOS CI runner) drops the oldest slot, which is the warning. So
+    // the mailbox holds at most one copy, and the Service flag is the
+    // "exactly once" guarantee.
+    try testing.expect(warnings <= 1);
+    try testing.expect(svc.events_dropped_warned);
     try testing.expect(mailbox.dropped >= 3);
     try testing.expectEqual(mailbox.dropped, svc.stats().events_dropped);
 }
