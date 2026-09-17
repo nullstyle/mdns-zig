@@ -1,7 +1,8 @@
 //! `mdns.profiles` tests (plan section 7, M5): the import-graph guard,
 //! Advert -> wire -> Engine -> `Resolved` -> `Parsed` round trips for the
-//! three schemas, the parser rules of plan section 3.4 and the qmesh
-//! `SeedSet` admission rule.
+//! three schemas, the parser rules of plan section 3.4, the qmesh
+//! `SeedSet` admission rule and the v0.1.1 dial-address ranking
+//! (`Resolved.preferred`, `SeedSet` re-admission, `studio.dialCandidate`).
 const std = @import("std");
 const Io = std.Io;
 const testing = std.testing;
@@ -260,7 +261,7 @@ test "qmesh advert round trips through the Engine" {
     try testing.expectEqual(@as(u8, 16), p.epoch.len);
     // The same value through SeedSet yields one contact with the v4 address.
     var seeds: profiles.qmesh.SeedSet = .{};
-    const c = seeds.accept(&res) orelse return error.NoContact;
+    const c = seeds.accept(&res, &.{}) orelse return error.NoContact;
     try testing.expectEqualSlices(u8, &id_b, &c.id);
     try testing.expectEqual(@as(u32, 3), c.ifindex);
     try testing.expectEqual(v4(.{ 10, 0, 3, 9 }, 7000), c.addr);
@@ -492,7 +493,7 @@ test "qmesh SeedSet emits once per (id, epoch)" {
     var seeds: profiles.qmesh.SeedSet = .{};
     const first = try resolvedWith("_qmesh._udp", "n", 7000, &.{ .{ .key = "id", .value = &id_hex }, .{ .key = "epoch", .value = "0a" } }, &.{v4(.{ 10, 0, 3, 9 }, 0)}, 3);
 
-    const c1 = seeds.accept(&first) orelse return error.NoContact;
+    const c1 = seeds.accept(&first, &.{}) orelse return error.NoContact;
     try testing.expectEqualSlices(u8, &id_b, &c1.id);
     try testing.expectEqual(@as(u128, 0x0a), c1.epoch);
     try testing.expectEqual(v4(.{ 10, 0, 3, 9 }, 7000), c1.addr);
@@ -500,42 +501,42 @@ test "qmesh SeedSet emits once per (id, epoch)" {
 
     // The same resolved again (a refresh the Engine would not even
     // re-emit) and the same (id, epoch) on another interface: nothing.
-    try testing.expect(seeds.accept(&first) == null);
+    try testing.expect(seeds.accept(&first, &.{}) == null);
     var other_if = first;
     other_if.ifindex = 4;
-    try testing.expect(seeds.accept(&other_if) == null);
+    try testing.expect(seeds.accept(&other_if, &.{}) == null);
     // An address-set change under the same epoch: nothing.
     var moved = first;
     moved.addrs.clear();
     try moved.addrs.append(v4(.{ 10, 0, 3, 10 }, 0));
-    try testing.expect(seeds.accept(&moved) == null);
+    try testing.expect(seeds.accept(&moved, &.{}) == null);
     try testing.expectEqual(@as(u64, 3), seeds.stats.duplicates);
 
     // A new epoch (the peer restarted and called updateTxt): admitted
     // again, once.
     const restarted = try resolvedWith("_qmesh._udp", "n", 7000, &.{ .{ .key = "id", .value = &id_hex }, .{ .key = "epoch", .value = "0b" } }, &.{v4(.{ 10, 0, 3, 9 }, 0)}, 3);
-    const c2 = seeds.accept(&restarted) orelse return error.NoContact;
+    const c2 = seeds.accept(&restarted, &.{}) orelse return error.NoContact;
     try testing.expectEqual(@as(u128, 0x0b), c2.epoch);
-    try testing.expect(seeds.accept(&restarted) == null);
+    try testing.expect(seeds.accept(&restarted, &.{}) == null);
     // The old epoch is still remembered.
-    try testing.expect(seeds.accept(&first) == null);
+    try testing.expect(seeds.accept(&first, &.{}) == null);
     try testing.expectEqual(@as(usize, 2), seeds.len);
 
     // A different id with the same epoch is its own pair.
     const other_hex = hexOf(spki_a);
     const other = try resolvedWith("_qmesh._udp", "m", 7001, &.{ .{ .key = "id", .value = &other_hex }, .{ .key = "epoch", .value = "0a" } }, &.{v4(.{ 10, 0, 3, 11 }, 0)}, 3);
-    const c3 = seeds.accept(&other) orelse return error.NoContact;
+    const c3 = seeds.accept(&other, &.{}) orelse return error.NoContact;
     try testing.expectEqualSlices(u8, &spki_a, &c3.id);
 
     // An invalid advert (bad id) is counted, not admitted; a later valid
     // one for the same pair still passes.
     const bad = try resolvedWith("_qmesh._udp", "z", 1, &.{ .{ .key = "id", .value = "zz" }, .{ .key = "epoch", .value = "1" } }, &.{v4(.{ 10, 0, 3, 12 }, 0)}, 3);
-    try testing.expect(seeds.accept(&bad) == null);
+    try testing.expect(seeds.accept(&bad, &.{}) == null);
     try testing.expectEqual(@as(u64, 1), seeds.stats.rejected);
 
     // forget re-admits.
     try testing.expectEqual(@as(usize, 2), seeds.forget(id_b));
-    try testing.expect(seeds.accept(&first) != null);
+    try testing.expect(seeds.accept(&first, &.{}) != null);
 }
 
 test "SeedSet drops fe80 without scope and prefers v4 then global v6" {
@@ -546,27 +547,211 @@ test "SeedSet drops fe80 without scope and prefers v4 then global v6" {
     // Only an unscoped link-local: no contact, and the pair is not
     // consumed, so a later resolved with a usable address passes.
     const ll_only = try resolvedWith("_qmesh._udp", "n", 7000, &pairs, &.{v6(fake_lan.linkLocal6(9), 0, 0)}, 3);
-    try testing.expect(seeds.accept(&ll_only) == null);
+    try testing.expect(seeds.accept(&ll_only, &.{}) == null);
     try testing.expectEqual(@as(u64, 1), seeds.stats.no_addr);
     try testing.expectEqual(@as(usize, 0), seeds.len);
 
     // Scoped link-local alone is usable, and keeps its scope.
     const ll_scoped = try resolvedWith("_qmesh._udp", "n", 7000, &pairs, &.{v6(fake_lan.linkLocal6(9), 0, 3)}, 3);
-    const c = seeds.accept(&ll_scoped) orelse return error.NoContact;
+    const c = seeds.accept(&ll_scoped, &.{}) orelse return error.NoContact;
     try testing.expectEqual(v6(fake_lan.linkLocal6(9), 7000, 3), c.addr);
     seeds.clear();
 
     // Global v6 beats link-local; v4 beats both, whatever the order.
     const mixed = try resolvedWith("_qmesh._udp", "n", 7000, &pairs, &.{ v6(fake_lan.linkLocal6(9), 0, 3), v6(global6(7), 0, 0) }, 3);
-    try testing.expectEqual(v6(global6(7), 7000, 0), seeds.accept(&mixed).?.addr);
+    try testing.expectEqual(v6(global6(7), 7000, 0), seeds.accept(&mixed, &.{}).?.addr);
     seeds.clear();
     const with_v4 = try resolvedWith("_qmesh._udp", "n", 7000, &pairs, &.{ v6(global6(7), 0, 0), v6(fake_lan.linkLocal6(9), 0, 3), v4(.{ 10, 0, 3, 9 }, 0) }, 3);
-    try testing.expectEqual(v4(.{ 10, 0, 3, 9 }, 7000), seeds.accept(&with_v4).?.addr);
+    try testing.expectEqual(v4(.{ 10, 0, 3, 9 }, 7000), seeds.accept(&with_v4, &.{}).?.addr);
     seeds.clear();
 
     // Unspecified addresses are skipped.
     const zeros = try resolvedWith("_qmesh._udp", "n", 7000, &pairs, &.{ v4(.{ 0, 0, 0, 0 }, 0), v6(@splat(0), 0, 0), v6(global6(1), 0, 0) }, 3);
-    try testing.expectEqual(v6(global6(1), 7000, 0), seeds.accept(&zeros).?.addr);
-    try testing.expectEqual(v6(global6(1), 7000, 0), profiles.qmesh.pickAddr(&zeros).?);
-    try testing.expect(profiles.qmesh.pickAddr(&ll_only) == null);
+    try testing.expectEqual(v6(global6(1), 7000, 0), seeds.accept(&zeros, &.{}).?.addr);
+    try testing.expectEqual(v6(global6(1), 7000, 0), profiles.qmesh.pickAddr(&zeros, &.{}).?);
+    try testing.expect(profiles.qmesh.pickAddr(&ll_only, &.{}) == null);
+}
+
+// ---- dial-address ranking (v0.1.1) -------------------------------------------
+
+/// This Mac as the browser sees it: en0 192.168.1.75/24 on ifindex 15
+/// and a VM bridge 192.168.215.0/24 on ifindex 27 (the address is the
+/// network base, as macOS gives a bridge), plus fe80::1/64 on en0.
+fn localTable() [2]mdns.Interface {
+    return .{
+        fake_lan.ifaceDual(15, "en0", .{ 192, 168, 1, 75 }, 24, 1),
+        fake_lan.iface4(27, "bridge101", .{ 192, 168, 215, 0 }, 24),
+    };
+}
+
+const qmesh_pairs_id_b = struct {
+    fn pairs(id_hex: *const [64]u8) [2]mdns.TxtPair {
+        return .{ .{ .key = "id", .value = id_hex }, .{ .key = "epoch", .value = "1" } };
+    }
+};
+
+test "preferredAddress ranks on-link same-interface first" {
+    const local = localTable();
+    const pairs = [_]mdns.TxtPair{.{ .key = "txtvers", .value = "1" }};
+
+    // Heard on en0 (15): the multi-homed responder's bridge address
+    // (network base: unusable) and its en0 address (on-link, same
+    // interface): the en0 one, with the SRV port attached.
+    const on_en0 = try resolvedWith("_qmesh._udp", "a", 4471, &pairs, &.{ v4(.{ 192, 168, 215, 0 }, 0), v4(.{ 192, 168, 1, 75 }, 0) }, 15);
+    try testing.expectEqual(v4(.{ 192, 168, 1, 75 }, 4471), on_en0.preferredAddress(&local).?);
+    try testing.expectEqual(mdns.AddrRank.on_link_same_if, on_en0.preferred(&local).?.rank);
+    try testing.expectEqual(mdns.AddrRank.unusable, mdns.rankAddress(v4(.{ 192, 168, 215, 0 }, 0), 15, &local));
+
+    // The same en0 address heard across the bridge (27): on-link, but
+    // not on the arrival interface.
+    const on_bridge = try resolvedWith("_qmesh._udp", "a", 4471, &pairs, &.{v4(.{ 192, 168, 1, 75 }, 0)}, 27);
+    try testing.expectEqual(mdns.AddrRank.on_link, on_bridge.preferred(&local).?.rank);
+    // A tailscale address on no local prefix: a foreign subnet.
+    try testing.expectEqual(mdns.AddrRank.any_v4, mdns.rankAddress(v4(.{ 100, 122, 9, 92 }, 0), 15, &local));
+    // With a table a global v6 that may route beats a foreign-subnet v4.
+    const routed = try resolvedWith("_qmesh._udp", "a", 4471, &pairs, &.{ v4(.{ 100, 122, 9, 92 }, 0), v6(global6(7), 0, 0) }, 15);
+    try testing.expectEqual(v6(global6(7), 4471, 0), routed.preferredAddress(&local).?);
+    // On-link beats both; a same-interface on-link beats an on-link one
+    // whatever the order in `addrs`.
+    const all = try resolvedWith("_qmesh._udp", "a", 4471, &pairs, &.{ v6(global6(7), 0, 0), v4(.{ 100, 122, 9, 92 }, 0), v4(.{ 192, 168, 1, 75 }, 0) }, 27);
+    try testing.expectEqual(v4(.{ 192, 168, 1, 75 }, 4471), all.preferredAddress(&local).?);
+    try testing.expectEqual(mdns.AddrRank.on_link, all.preferred(&local).?.rank);
+    var all15 = all;
+    all15.ifindex = 15;
+    try testing.expectEqual(mdns.AddrRank.on_link_same_if, all15.preferred(&local).?.rank);
+
+    // The bridge address alone: nothing dialable.
+    const base_only = try resolvedWith("_qmesh._udp", "a", 4471, &pairs, &.{v4(.{ 192, 168, 215, 0 }, 0)}, 27);
+    try testing.expect(base_only.preferredAddress(&local) == null);
+    // A network base on a /31 or /32 is a host.
+    const p2p = [_]mdns.Interface{fake_lan.iface4(9, "ptp", .{ 10, 9, 9, 0 }, 31)};
+    try testing.expectEqual(mdns.AddrRank.on_link_same_if, mdns.rankAddress(v4(.{ 10, 9, 9, 0 }, 0), 9, &p2p));
+    // Link-local v6 is never "on-link" for dialing: scoped ranks last,
+    // unscoped is unusable, even on the arrival interface's own prefix.
+    try testing.expectEqual(mdns.AddrRank.scoped_ll, mdns.rankAddress(v6(fake_lan.linkLocal6(9), 0, 15), 15, &local));
+    try testing.expectEqual(mdns.AddrRank.unusable, mdns.rankAddress(v6(fake_lan.linkLocal6(9), 0, 0), 15, &local));
+    try testing.expectEqual(mdns.AddrRank.unusable, mdns.rankAddress(v4(.{ 0, 0, 0, 0 }, 0), 15, &local));
+    try testing.expectEqual(mdns.AddrRank.unusable, mdns.rankAddress(v6(@splat(0), 0, 0), 15, &local));
+
+    // No table: nothing is on-link, and the pre-0.1.1 order applies:
+    // the first v4, then a global v6, then a scoped link-local.
+    try testing.expectEqual(v4(.{ 100, 122, 9, 92 }, 4471), routed.preferredAddress(&.{}).?);
+    try testing.expectEqual(v4(.{ 192, 168, 215, 0 }, 4471), on_en0.preferredAddress(&.{}).?);
+    const ll_and_global = try resolvedWith("_qmesh._udp", "a", 4471, &pairs, &.{ v6(fake_lan.linkLocal6(9), 0, 3), v6(global6(7), 0, 0) }, 3);
+    try testing.expectEqual(v6(global6(7), 4471, 0), ll_and_global.preferredAddress(&.{}).?);
+    try testing.expectEqual(v6(global6(7), 4471, 0), ll_and_global.preferredAddress(&local).?);
+}
+
+test "SeedSet re-admits a better address for the same id and epoch" {
+    const local = localTable();
+    const id_hex = hexOf(id_b);
+    const pairs = qmesh_pairs_id_b.pairs(&id_hex);
+    var seeds: profiles.qmesh.SeedSet = .{};
+
+    // First heard across the bridge (27) with only a VPN address: a
+    // foreign subnet, admitted at `any_v4` (the observed "B joined A at
+    // an address A was not bound to").
+    const first = try resolvedWith("_qmesh._udp", "n", 4471, &pairs, &.{v4(.{ 100, 122, 9, 92 }, 0)}, 27);
+    const c1 = seeds.accept(&first, &local) orelse return error.NoContact;
+    try testing.expectEqual(v4(.{ 100, 122, 9, 92 }, 4471), c1.addr);
+    try testing.expectEqual(mdns.AddrRank.any_v4, c1.rank);
+    try testing.expectEqual(@as(u32, 27), c1.ifindex);
+
+    // The same advert again, and the same address on another interface:
+    // no better, so duplicates, no Contact.
+    try testing.expect(seeds.accept(&first, &local) == null);
+    var same_elsewhere = first;
+    same_elsewhere.ifindex = 15;
+    try testing.expect(seeds.accept(&same_elsewhere, &local) == null);
+    try testing.expectEqual(@as(u64, 2), seeds.stats.duplicates);
+    try testing.expectEqual(@as(u64, 0), seeds.stats.readmitted);
+
+    // Then the en0 resolve (15) with the LAN address: on-link, same
+    // interface, strictly better: re-admitted with the new address.
+    const better = try resolvedWith("_qmesh._udp", "n", 4471, &pairs, &.{ v4(.{ 100, 122, 9, 92 }, 0), v4(.{ 192, 168, 1, 75 }, 0) }, 15);
+    const c2 = seeds.accept(&better, &local) orelse return error.NoContact;
+    try testing.expectEqualSlices(u8, &id_b, &c2.id);
+    try testing.expectEqual(@as(u128, 1), c2.epoch);
+    try testing.expectEqual(v4(.{ 192, 168, 1, 75 }, 4471), c2.addr);
+    try testing.expectEqual(mdns.AddrRank.on_link_same_if, c2.rank);
+    try testing.expectEqual(@as(u32, 15), c2.ifindex);
+    try testing.expectEqual(@as(u64, 1), seeds.stats.readmitted);
+    try testing.expectEqual(@as(usize, 1), seeds.len);
+
+    // The best rank is final: the same, a worse (the first again), and an
+    // equal-ranked resolve are duplicates.
+    try testing.expect(seeds.accept(&better, &local) == null);
+    try testing.expect(seeds.accept(&first, &local) == null);
+    try testing.expectEqual(@as(u64, 4), seeds.stats.duplicates);
+    try testing.expectEqual(@as(u64, 1), seeds.stats.readmitted);
+
+    // A new epoch admits fresh at whatever rank it carries, and starts its
+    // own ladder: the VPN address first, then the LAN address again.
+    const restarted = try resolvedWith("_qmesh._udp", "n", 4471, &.{ .{ .key = "id", .value = &id_hex }, .{ .key = "epoch", .value = "2" } }, &.{v4(.{ 100, 122, 9, 92 }, 0)}, 27);
+    const c3 = seeds.accept(&restarted, &local) orelse return error.NoContact;
+    try testing.expectEqual(@as(u128, 2), c3.epoch);
+    try testing.expectEqual(mdns.AddrRank.any_v4, c3.rank);
+    var restarted_lan = restarted;
+    restarted_lan.ifindex = 15;
+    try restarted_lan.addrs.append(v4(.{ 192, 168, 1, 75 }, 0));
+    const c4 = seeds.accept(&restarted_lan, &local) orelse return error.NoContact;
+    try testing.expectEqual(v4(.{ 192, 168, 1, 75 }, 4471), c4.addr);
+    try testing.expectEqual(@as(u64, 2), seeds.stats.readmitted);
+    try testing.expectEqual(@as(usize, 2), seeds.len);
+
+    // forget drops every epoch; the next resolve is a fresh admission.
+    try testing.expectEqual(@as(usize, 2), seeds.forget(id_b));
+    const c5 = seeds.accept(&first, &local) orelse return error.NoContact;
+    try testing.expectEqual(mdns.AddrRank.any_v4, c5.rank);
+    // No table: the old v4-first order, so a v4 after a global v6 is the
+    // one re-admission possible, and a global v6 after a v4 is not.
+    var plain: profiles.qmesh.SeedSet = .{};
+    try testing.expect(plain.accept(&first, &.{}) != null);
+    try testing.expect(plain.accept(&better, &.{}) == null);
+    try testing.expectEqual(@as(u64, 0), plain.stats.readmitted);
+    const v6_only = try resolvedWith("_qmesh._udp", "n", 4471, &pairs, &.{v6(global6(7), 0, 0)}, 15);
+    try testing.expect(plain.accept(&v6_only, &.{}) == null);
+    plain.clear();
+    try testing.expectEqual(mdns.AddrRank.global_v6, plain.accept(&v6_only, &.{}).?.rank);
+    try testing.expectEqual(mdns.AddrRank.any_v4, plain.accept(&first, &.{}).?.rank);
+    try testing.expectEqual(@as(u64, 1), plain.stats.readmitted);
+    // With a table the same two resolves go the other way.
+    plain.clear();
+    try testing.expectEqual(mdns.AddrRank.any_v4, plain.accept(&first, &local).?.rank);
+    try testing.expectEqual(mdns.AddrRank.global_v6, plain.accept(&v6_only, &local).?.rank);
+    try testing.expectEqual(@as(u64, 2), plain.stats.readmitted);
+}
+
+test "studio profile ranks the dialable on-link address first" {
+    const local = localTable();
+    const spki_hex = hexOf(spki_a);
+    const pairs = [_]mdns.TxtPair{ .{ .key = "spki", .value = &spki_hex }, .{ .key = "epoch", .value = "0a" }, .{ .key = "role", .value = "performer" } };
+
+    // The bridge's resolve first (as shared-studio's reviewer saw): the
+    // VM bridge network base is unusable, so a VPN address is all it
+    // offers.
+    const via_bridge = try resolvedWith("_shared-studio._udp", "Alice", 5000, &pairs, &.{ v4(.{ 192, 168, 215, 0 }, 0), v4(.{ 100, 122, 9, 92 }, 0) }, 27);
+    const c1 = profiles.studio.dialCandidate(&via_bridge, &local) orelse return error.NoCandidate;
+    try testing.expectEqual(v4(.{ 100, 122, 9, 92 }, 5000), c1.addr);
+    try testing.expectEqual(mdns.AddrRank.any_v4, c1.rank);
+    // Then en0's: on-link, same interface; strictly better, so a ring of
+    // candidates puts it first.
+    const via_en0 = try resolvedWith("_shared-studio._udp", "Alice", 5000, &pairs, &.{ v4(.{ 192, 168, 1, 75 }, 0), v6(fake_lan.linkLocal6(9), 0, 15) }, 15);
+    const c2 = profiles.studio.dialCandidate(&via_en0, &local) orelse return error.NoCandidate;
+    try testing.expectEqual(v4(.{ 192, 168, 1, 75 }, 5000), c2.addr);
+    try testing.expectEqual(mdns.AddrRank.on_link_same_if, c2.rank);
+    try testing.expect(c2.betterThan(c1));
+    try testing.expect(!c1.betterThan(c2));
+    try testing.expect(!c2.betterThan(c2));
+    try testing.expectEqual(v4(.{ 192, 168, 1, 75 }, 5000), profiles.studio.dialAddress(&via_en0, &local).?);
+
+    // A link-local v6 alone is never a studio dial address (the qmsg
+    // endpoint parser takes no zone), scoped or not; a global v6 is.
+    const ll_only = try resolvedWith("_shared-studio._udp", "Alice", 5000, &pairs, &.{v6(fake_lan.linkLocal6(9), 0, 15)}, 15);
+    try testing.expect(profiles.studio.dialCandidate(&ll_only, &local) == null);
+    try testing.expect(profiles.studio.dialAddress(&ll_only, &.{}) == null);
+    const global_only = try resolvedWith("_shared-studio._udp", "Alice", 5000, &pairs, &.{ v6(fake_lan.linkLocal6(9), 0, 15), v6(global6(3), 0, 0) }, 15);
+    try testing.expectEqual(v6(global6(3), 5000, 0), profiles.studio.dialAddress(&global_only, &local).?);
+    // No table: v4 first, as shared-studio's own picker did before.
+    try testing.expectEqual(v4(.{ 192, 168, 215, 0 }, 5000), profiles.studio.dialAddress(&via_bridge, &.{}).?);
 }

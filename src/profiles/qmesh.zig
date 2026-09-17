@@ -9,10 +9,12 @@
 //! browser gets a fresh `resolved`, and `SeedSet` admits the peer again.
 //!
 //! `SeedSet` is the browser-side glue of plan section 5, flow 2: it turns
-//! `resolved` events into at most one `Contact` per `(id, epoch)` and
-//! picks the address a qmesh `Addr` can carry. The `switch` into
-//! `qmesh.Addr` lives in the consumer (plan section 11, decision 5), so
-//! this file never imports qmesh.
+//! `resolved` events into one `Contact` per `(id, epoch)`, plus one more
+//! each time a later `resolved` for the same pair carries a strictly
+//! better-ranked address (v0.1.1, `Resolved.preferred` against the
+//! browser's own interface table), and picks the address a qmesh `Addr`
+//! can carry. The `switch` into `qmesh.Addr` lives in the consumer (plan
+//! section 11, decision 5), so this file never imports qmesh.
 const std = @import("std");
 const Io = std.Io;
 const profiles = @import("root.zig");
@@ -21,6 +23,8 @@ const Txt = profiles.Txt;
 const TxtPair = profiles.TxtPair;
 const ServiceDesc = profiles.ServiceDesc;
 const Resolved = profiles.Resolved;
+const Interface = profiles.Interface;
+const AddrRank = profiles.AddrRank;
 
 pub const service_type = "_qmesh._udp";
 pub const alpn = "qmesh/2";
@@ -128,41 +132,25 @@ pub const Contact = struct {
     addr: Io.net.IpAddress,
     /// The interface the `resolved` was heard on.
     ifindex: u32,
+    /// How `addr` ranked against the local interface table
+    /// (`Resolved.preferred`); a re-admitted `Contact` carries a
+    /// strictly better rank than the one before it.
+    rank: AddrRank,
 };
 
 /// The address a qmesh `Addr` (no scope field) can dial, from
-/// `resolved.addrs`, in this preference order:
-///
-/// 1. the first IPv4 address (not `0.0.0.0`);
-/// 2. else the first IPv6 address outside `fe80::/10` (global or ULA, not
-///    `::`);
-/// 3. else the first link-local IPv6 address whose scope is set
-///    (`.ip6.interface.index != 0`); a `fe80::` address without a scope
-///    is never returned, because nothing can dial it.
-///
-/// IPv4 first: every consumer parses a plain literal, a v4 address on the
-/// link is always reachable, and v6 global addresses rotate (privacy
-/// extensions) more often than the TTL of the AAAA record. The port is
-/// `resolved.port`.
-pub fn pickAddr(resolved: *const Resolved) ?Io.net.IpAddress {
-    const port = resolved.port;
-    const addrs = resolved.addrs.slice();
-    for (addrs) |a| {
-        if (a == .ip4 and !std.mem.allEqual(u8, &a.ip4.bytes, 0)) {
-            return .{ .ip4 = .{ .bytes = a.ip4.bytes, .port = port } };
-        }
-    }
-    for (addrs) |a| {
-        if (a == .ip6 and !isLinkLocal6(a.ip6.bytes) and !std.mem.allEqual(u8, &a.ip6.bytes, 0)) {
-            return .{ .ip6 = .{ .bytes = a.ip6.bytes, .port = port, .interface = a.ip6.interface } };
-        }
-    }
-    for (addrs) |a| {
-        if (a == .ip6 and isLinkLocal6(a.ip6.bytes) and a.ip6.interface.index != 0) {
-            return .{ .ip6 = .{ .bytes = a.ip6.bytes, .port = port, .interface = a.ip6.interface } };
-        }
-    }
-    return null;
+/// `resolved.addrs`: `Resolved.preferredAddress` against `local`, the
+/// browser's own interface table (`Service.interfaces()`, or `&.{}`
+/// when there is none). The order with a table: on-link on the arrival
+/// interface, on-link on any local interface, global v6, a v4 on a
+/// foreign subnet, scoped link-local v6. Without a table nothing is
+/// known to be on-link and the pre-0.1.1 order applies: IPv4 (not
+/// `0.0.0.0`), then IPv6 outside `fe80::/10` (not `::`), then a
+/// link-local IPv6 whose scope is set (`.ip6.interface.index != 0`); a
+/// `fe80::` without a scope is never returned, because nothing can dial
+/// it. The port is `resolved.port`.
+pub fn pickAddr(resolved: *const Resolved, local: []const Interface) ?Io.net.IpAddress {
+    return resolved.preferredAddress(local);
 }
 
 /// `fe80::/10` (RFC 4291 section 2.5.6); local copy so this file needs
@@ -177,8 +165,13 @@ pub const SeedStats = struct {
     rejected: u64 = 0,
     /// Valid adverts with no dialable address.
     no_addr: u64 = 0,
-    /// Valid adverts already admitted under the same `(id, epoch)`.
+    /// Valid adverts already admitted under the same `(id, epoch)` with
+    /// an address ranked no better than the admitted one.
     duplicates: u64 = 0,
+    /// Pairs admitted again because a later `resolved` (another
+    /// interface, an address change) carried a strictly better-ranked
+    /// address.
+    readmitted: u64 = 0,
     /// Entries forgotten because the set was full.
     evicted: u64 = 0,
 };
@@ -199,28 +192,59 @@ pub fn SeedSetSized(comptime cap: usize) type {
         seq: u64 = 0,
         stats: SeedStats = .{},
 
-        pub const Entry = struct { id: [32]u8, epoch: u128, seq: u64 };
+        pub const Entry = struct {
+            id: [32]u8,
+            epoch: u128,
+            seq: u64,
+            /// `Preferred.key` of the admitted address (its `AddrRank`
+            /// under the with-table or table-less order).
+            rank: u8 = @backingInt(AddrRank.unusable),
+        };
 
-        /// One `Contact` per `(id, epoch)`. Returns null for an invalid
-        /// advert, for an advert with no dialable address (see
-        /// `pickAddr`), and for a pair already admitted. A `resolved`
-        /// re-emitted with a new `epoch` passes again; one re-emitted for
-        /// an address or SRV change under the same epoch does not.
-        pub fn accept(s: *Self, resolved: *const Resolved) ?Contact {
+        /// One `Contact` per `(id, epoch)`, and one more whenever a later
+        /// `resolved` for the same pair ranks a strictly better address
+        /// (`Resolved.preferred` against `local`, the browser's own
+        /// interface table from `Service.interfaces()`; `&.{}` keeps the
+        /// pre-0.1.1 v4-first order). Returns null for an invalid advert,
+        /// for an advert with no dialable address (see `pickAddr`), and
+        /// for a pair already admitted at a rank at least as good. A
+        /// `resolved` re-emitted with a new `epoch` passes again; one
+        /// re-emitted for an SRV or address change under the same epoch
+        /// passes only when the address ranks better.
+        ///
+        /// Re-admission (v0.1.1): a multi-homed peer yields one `resolved`
+        /// per interface it was heard on, and the first may carry an
+        /// address this host cannot reach (a VM bridge's `192.168.215.0`,
+        /// a VPN address). The consumer MUST tolerate a second `Contact`
+        /// for the same `id`: in qmesh a second `Endpoint.startJoin` for
+        /// an id overwrites the pending join's contact (so the retry
+        /// after a failed dial uses the better address) and re-emits the
+        /// connect; the connect is a no-op while a session to that id is
+        /// established or a dial to it is in flight, so the better
+        /// address is dialed once the bad one times out. Nothing is torn
+        /// down.
+        pub fn accept(s: *Self, resolved: *const Resolved, local: []const Interface) ?Contact {
             const p = Parsed.parse(resolved) catch {
                 s.stats.rejected += 1;
                 return null;
             };
-            const addr = pickAddr(resolved) orelse {
+            const pref = resolved.preferred(local) orelse {
                 s.stats.no_addr += 1;
                 return null;
             };
-            if (s.contains(p.id, p.epoch.value)) {
-                s.stats.duplicates += 1;
-                return null;
+            const rank = pref.key;
+            const contact: Contact = .{ .id = p.id, .epoch = p.epoch.value, .addr = pref.addr, .ifindex = resolved.ifindex, .rank = pref.rank };
+            if (s.find(p.id, p.epoch.value)) |e| {
+                if (rank >= e.rank) {
+                    s.stats.duplicates += 1;
+                    return null;
+                }
+                e.rank = rank;
+                s.stats.readmitted += 1;
+                return contact;
             }
-            s.insert(p.id, p.epoch.value);
-            return .{ .id = p.id, .epoch = p.epoch.value, .addr = addr, .ifindex = resolved.ifindex };
+            s.insert(p.id, p.epoch.value, rank);
+            return contact;
         }
 
         pub fn contains(s: *const Self, id: [32]u8, epoch: u128) bool {
@@ -228,6 +252,13 @@ pub fn SeedSetSized(comptime cap: usize) type {
                 if (e.epoch == epoch and std.mem.eql(u8, &e.id, &id)) return true;
             }
             return false;
+        }
+
+        fn find(s: *Self, id: [32]u8, epoch: u128) ?*Entry {
+            for (s.entries[0..s.len]) |*e| {
+                if (e.epoch == epoch and std.mem.eql(u8, &e.id, &id)) return e;
+            }
+            return null;
         }
 
         /// Forget every `(id, *)` so the peer is admitted again at its
@@ -254,8 +285,8 @@ pub fn SeedSetSized(comptime cap: usize) type {
         /// Append while there is room; when full, overwrite the entry
         /// admitted longest ago (smallest `seq`, one pass over at most
         /// `cap` entries).
-        fn insert(s: *Self, id: [32]u8, epoch: u128) void {
-            const entry: Entry = .{ .id = id, .epoch = epoch, .seq = s.seq };
+        fn insert(s: *Self, id: [32]u8, epoch: u128, rank: u8) void {
+            const entry: Entry = .{ .id = id, .epoch = epoch, .seq = s.seq, .rank = rank };
             s.seq += 1;
             if (s.len < cap) {
                 s.entries[s.len] = entry;
@@ -272,7 +303,7 @@ pub fn SeedSetSized(comptime cap: usize) type {
     };
 }
 
-/// The default set: 64 `(id, epoch, seq)` entries, 4 KiB.
+/// The default set: 64 `(id, epoch, seq, rank)` entries, about 4 KiB.
 pub const SeedSet = SeedSetSized(64);
 
 test "qmesh advert derives the instance from the id" {
@@ -298,9 +329,9 @@ test "qmesh advert derives the instance from the id" {
 test "SeedSet ring evicts the oldest when full" {
     var s: SeedSetSized(2) = .{};
     try std.testing.expect(!s.contains(@splat(1), 0));
-    s.insert(@splat(1), 0);
-    s.insert(@splat(2), 0);
-    s.insert(@splat(3), 0);
+    s.insert(@splat(1), 0, 3);
+    s.insert(@splat(2), 0, 3);
+    s.insert(@splat(3), 0, 3);
     try std.testing.expect(!s.contains(@splat(1), 0));
     try std.testing.expect(s.contains(@splat(2), 0));
     try std.testing.expect(s.contains(@splat(3), 0));
@@ -311,9 +342,9 @@ test "SeedSet ring evicts the oldest when full" {
     // After a forget the set refills, and the next eviction still takes
     // the entry admitted longest ago (3), not the newest (4). (A ring
     // cursor left where it was by the swap-remove took the newest.)
-    s.insert(@splat(4), 0);
+    s.insert(@splat(4), 0, 3);
     try std.testing.expectEqual(@as(usize, 2), s.len);
-    s.insert(@splat(5), 0);
+    s.insert(@splat(5), 0, 3);
     try std.testing.expect(!s.contains(@splat(3), 0));
     try std.testing.expect(s.contains(@splat(4), 0));
     try std.testing.expect(s.contains(@splat(5), 0));
@@ -321,8 +352,8 @@ test "SeedSet ring evicts the oldest when full" {
     // Forgetting the oldest and refilling: the survivor is the older of
     // the two that remain.
     try std.testing.expectEqual(@as(usize, 1), s.forget(@splat(4)));
-    s.insert(@splat(6), 0);
-    s.insert(@splat(7), 0);
+    s.insert(@splat(6), 0, 3);
+    s.insert(@splat(7), 0, 3);
     try std.testing.expect(!s.contains(@splat(5), 0));
     try std.testing.expect(s.contains(@splat(6), 0));
     try std.testing.expect(s.contains(@splat(7), 0));

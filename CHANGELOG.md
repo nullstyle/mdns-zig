@@ -2,6 +2,92 @@
 
 ## Unreleased
 
+## 0.1.1 - 2026-09-17
+
+Two bugs found by real use on one multi-homed Mac (qmesh-zig `--mdns`
+and shared-studio `--discover`), plus the API they needed. No
+flood-guard budget changed.
+
+### Fixed
+
+- **Same-host echo drop (B1).** A second program on the same host
+  browsing the same type sends a query byte-identical to ours (ID 0,
+  one question, empty known-answer list) from our own address, so it
+  passed both own-echo tests and was dropped unanswered; the peer
+  resolved us only when its query happened to fall outside the 2 s echo
+  window (qmesh `seeds joined=0`, `rx_echo` counting the peer's lookup
+  queries). `Engine.handle` now stops an echoed response or probe
+  (Authority section present) at the echo test and lets an echoed plain
+  query through to the responder. The cost is answering our own ladder
+  queries when we browse a type we advertise (about 36 packets per pair
+  per day under the 1 s rate rule); the bridged-echo re-announce and the
+  conflict logic are unchanged. `Stats.rx_echo_answered` counts the
+  answered echoes. Named test: `byte-identical query from our own
+  address is still answered`; `byte-identical query from a foreign
+  source is not an echo` still passes.
+- **Echo window 2 s -> 1 s.** `timers.echo_window_us` is now sized
+  from the longest round trip an echo can take back into `handle`: the
+  path (a bridged echo through a Wi-Fi access point's DTIM hold,
+  100-300 ms) plus the mode-B step cap (one 250 ms timed receive per
+  step) plus mode C's mailbox wait (250 ms per event while the
+  `Mailbox` is full), 800 ms worst case; mode A ages an echo by the
+  embedder's tick cadence plus `rx_poll_interval_us`, so tick at least
+  every ~500 ms and keep `rx_poll_interval_us` at or below ~100 ms
+  (both option docs say so). The window no longer decides whether a
+  query is answered, only whether a response or a probe is ours; an
+  echo later than the window is parsed as a cooperating peer's packet
+  (identical rdata, never a conflict), which loses the section 10.2
+  re-announce for a late bridged announcement echo (test `late bridged
+  echo is a peer response, not a conflict`). `bridged echo re-announces
+  address records` keeps its name and now drives the re-announce with a
+  fresh answer instead of replaying a 1.5 s-old datagram; the bounce
+  back across the bridge is asserted suppressed by the 1 s rule.
+- **Multi-homed address choice (B2).** A browser gets one `resolved`
+  per interface it hears a responder on, and on a Mac with a Lima bridge
+  the first can carry only `192.168.215.0` (the bridge subnet's base,
+  undialable) or a VPN tunnel address; `SeedSet` admitted one `Contact`
+  per `(id, epoch)`, the first, so qmesh joined an address the peer was
+  not listening on. See the API below. A live capture also showed the
+  first announce cohort on a freshly bound v4 socket all leaving on the
+  last `IP_MULTICAST_IF` set (bridge101), so a `lookup --once` started
+  at the same instant as the advertiser heard only that interface; that
+  Darwin send-path quirk is documented as an open follow-up, not fixed
+  here.
+
+### Added
+
+- `Resolved.preferredAddress(local: []const Interface) ?IpAddress` and
+  `Resolved.preferred(local) ?Preferred{addr, rank, key}`: the best entry of
+  `addrs` ranked against the browser's own `Service.interfaces()`
+  (`AddrRank`: on-link on the arrival interface, on-link on any local
+  interface, global v6, foreign-subnet v4, scoped link-local; the
+  network base of a local prefix, `0.0.0.0`, `::` and an unscoped
+  `fe80::` are never returned). With an empty table the pre-0.1.1
+  v4-first order applies. `mdns.rankAddress` is the per-address rule;
+  `Preferred.betterThan(other)` is the one comparison between two
+  candidates (it reads the stored `key`, so it holds with or without a
+  table; `AddrRank.better` is the raw with-table order only), and
+  equal-ranked candidates keep first-arrival order.
+- `profiles.qmesh.SeedSet.accept(&resolved, local)` re-admits an
+  `(id, epoch)` when a strictly better-ranked address arrives
+  (`SeedStats.readmitted`, `Contact.rank`); the consumer must tolerate a
+  second `Contact` per id (qmesh's `startJoin` is safe to repeat, see
+  `docs/integration.md`). `pickAddr(&resolved, local)` wraps
+  `preferredAddress`.
+- `profiles.studio.dialCandidate(&resolved, local) ?Preferred` and
+  `dialAddress`: the same ranking minus link-local v6, for
+  shared-studio's endpoint ring.
+- Named tests: `preferredAddress ranks on-link same-interface first`,
+  `SeedSet re-admits a better address for the same id and epoch`,
+  `studio profile ranks the dialable on-link address first`.
+
+### Changed (API)
+
+- `SeedSet.accept` and `qmesh.pickAddr` take the local interface table
+  as a second argument (`&.{}` for the old behaviour).
+- `Stats` gains `rx_echo_answered`; `SeedStats` gains `readmitted`;
+  `Contact` gains `rank`.
+
 ## 0.1.0 - 2026-09-16
 
 First release. Every item below is in the tarball unless it says

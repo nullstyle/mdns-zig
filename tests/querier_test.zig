@@ -580,10 +580,14 @@ test "byte-identical query from a foreign source is not an echo" {
     r.e.handle(sent, peerMeta(true), r.now());
     try testing.expectEqual(@as(u64, 0), r.e.stats().rx_echo);
     try testing.expectEqual(@as(u64, 1), r.e.stats().rx);
-    // From our own address: an echo, dropped silently.
+    // From our own address: an echo, counted. A plain query still goes
+    // to the responder (a same-host peer's identical query, v0.1.1);
+    // this engine advertises nothing, so nothing is answered.
     const own: Engine.RxMeta = .{ .from = .{ .ip4 = .{ .bytes = .{ 10, 0, 3, 1 }, .port = 5353 } }, .ifindex = 3, .dst_multicast = true };
     r.e.handle(sent, own, r.now());
     try testing.expectEqual(@as(u64, 1), r.e.stats().rx_echo);
+    try testing.expectEqual(@as(u64, 1), r.e.stats().rx_echo_answered);
+    try testing.expectEqual(@as(u64, 1), r.e.stats().tx);
     // Our own address but different bytes (a peer stack on this host,
     // e.g. mDNSResponder): not an echo either.
     var buf2: [1500]u8 = undefined;
@@ -591,8 +595,8 @@ test "byte-identical query from a foreign source is not an echo" {
     try other.question(packets.typeName("_other._tcp"), .ptr, false);
     r.e.handle(other.bytes(), own, r.now());
     try testing.expectEqual(@as(u64, 1), r.e.stats().rx_echo);
-    // After the 2 s window the digest has aged out.
-    r.e.handle(sent, own, r.now() + 2 * s_us + 1);
+    // After the echo window the digest has aged out.
+    r.e.handle(sent, own, r.now() + timers.echo_window_us + 1);
     try testing.expectEqual(@as(u64, 1), r.e.stats().rx_echo);
     try testing.expectEqual(@as(u64, 4), r.e.stats().rx);
     try testing.expectEqual(@as(u64, 0), r.e.stats().dropped_malformed);

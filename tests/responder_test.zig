@@ -1022,13 +1022,35 @@ test "bridged echo re-announces address records" {
     try r.advance(500 * ms_us);
     try testing.expectEqual(@as(usize, 0), r.log.items.len);
 
-    // The same echo (still inside the echo ring's window) more than a
+    // A cache-flush A for our host multicast on ifindex 3 more than a
     // second after ifindex 4 last multicast its addresses (the
     // wireless-to-wired case of section 10.2 where the two announcements
-    // were not simultaneous): re-announced at once, address records
-    // only, ifindex 4's own address.
+    // were not simultaneous): a peer on ifindex 3 asks for the host's A
+    // at t_ann + 1.5 s, and the unique answer goes out at once on that
+    // pair alone. (Before v0.1.1 the announcement itself was replayed
+    // here; the echo window is 1 s now, so a 1.5 s-old datagram is by
+    // definition not an echo.)
     r.sc.set(t_ann + 1500 * ms_us);
-    r.e.handle(echo.bytes, .{ .from = own4, .ifindex = 4, .dst_multicast = true }, r.now());
+    var qbuf: [512]u8 = undefined;
+    try r.rx(try simpleQuery(&qbuf, hostName(), .a, false), foreign4, 3);
+    try r.tick();
+    try testing.expectEqual(@as(usize, 1), r.log.items.len);
+    const ans3 = &r.log.items[0];
+    try testing.expectEqual(@as(u32, 3), ans3.ifindex);
+    try testing.expect(ans3.multicast());
+    try testing.expect(ans3.find(.answer, hostName(), .a).?.cache_flush);
+    var ans_buf: [1500]u8 = undefined;
+    @memcpy(ans_buf[0..ans3.bytes.len], ans3.bytes);
+    const ans_bytes = ans_buf[0..ans3.bytes.len];
+    r.clearLog();
+
+    // That answer bridges over to ifindex 4 100 ms later, from our own
+    // 10.0.3.1: a bridged echo that just flushed ifindex 4's addresses
+    // out of every cache on that link, 1.6 s after ifindex 4 last
+    // multicast them: re-announced at once, address records only,
+    // ifindex 4's own address.
+    r.sc.advance(100 * ms_us);
+    r.e.handle(ans_bytes, .{ .from = own4, .ifindex = 4, .dst_multicast = true }, r.now());
     try testing.expectEqual(@as(u64, 2), r.e.stats().rx_echo_bridged);
     try testing.expectEqual(@as(u64, 0), r.e.stats().conflicts);
     try testing.expectEqual(@as(?u64, r.now()), r.e.nextDeadline(r.now()));
@@ -1046,11 +1068,11 @@ test "bridged echo re-announces address records" {
     _ = try r.sink.drain(&r.e);
     try r.sink.expectCount(.host_renamed, 0);
     try r.sink.expectCount(.registered, 0);
-    // Its own bridged echo back on ifindex 3 flushed ifindex 3's set
-    // from the peers (last multicast 1.55 s ago, past the grace): ifindex
-    // 3 re-announces its addresses at once on both its pairs. That echo
-    // lands on ifindex 4 within a second of ifindex 4's own re-announce
-    // and starts nothing: the bounce ends there.
+    // Its own bridged echo back on ifindex 3 (last multicast of the
+    // host's A on ifindex 3 was the answer 0.15 s ago, inside the
+    // one-second rule): counted, and the re-announce is dropped, not
+    // deferred (Revision 7): the bounce ends there, and nothing more
+    // is sent for 5 s.
     r.sc.advance(50 * ms_us);
     var re_buf: [1500]u8 = undefined;
     @memcpy(re_buf[0..re.bytes.len], re.bytes);
@@ -1058,23 +1080,62 @@ test "bridged echo re-announces address records" {
     r.clearLog();
     r.e.handle(re_bytes, .{ .from = .{ .ip4 = .{ .bytes = .{ 10, 0, 4, 1 }, .port = 5353 } }, .ifindex = 3, .dst_multicast = true }, r.now());
     try testing.expectEqual(@as(u64, 3), r.e.stats().rx_echo_bridged);
-    try testing.expectEqual(@as(?u64, r.now()), r.e.nextDeadline(r.now()));
-    try r.tick();
-    try testing.expectEqual(@as(usize, 2), r.log.items.len);
-    for (r.log.items) |*s| {
-        try testing.expectEqual(@as(u32, 3), s.ifindex);
-        try testing.expectEqual(@as(usize, 0), s.countRecords(instName(), .srv));
-        try testing.expectEqual([4]u8{ 10, 0, 3, 1 }, try wire.rdata.decodeA(s.find(.answer, hostName(), .a).?.rdata));
-    }
-    r.sc.advance(50 * ms_us);
-    r.e.handle(r.log.items[0].bytes, .{ .from = own4, .ifindex = 4, .dst_multicast = true }, r.now());
-    try testing.expectEqual(@as(u64, 4), r.e.stats().rx_echo_bridged);
     try testing.expectEqual(null, r.e.nextDeadline(r.now()));
     try r.advance(5 * s_us);
-    try testing.expectEqual(@as(usize, 2), r.log.items.len);
+    try testing.expectEqual(@as(usize, 0), r.log.items.len);
     try testing.expectEqual(@as(u64, 0), r.e.stats().conflicts);
     _ = try r.sink.drain(&r.e);
     try testing.expectEqual(@as(usize, 0), r.sink.len());
+}
+
+test "late bridged echo is a peer response, not a conflict" {
+    // The echo window (`timers.echo_window_us`, 1 s) bounds bridged echo
+    // recognition too: bridge latency + the mode-B step cap + the mode-C
+    // mailbox wait must stay under it. An announcement that bridges back
+    // later than that is by definition not an echo: it is parsed as a
+    // cooperating peer's response carrying our host's A with identical
+    // rdata, which the responder never reads as a conflict (section 9,
+    // "identical rdata is not a conflict"). The price, documented in
+    // `timers.zig`, is that the section 10.2 re-announce does not fire
+    // for it, and its records enter our cache as a peer's.
+    const r = try Rig.init(.{});
+    defer r.deinit();
+    _ = try r.e.advertise(.{ .service_type = svc_type, .instance = inst, .port = port }, 0);
+    try r.runUntilRegistered();
+    var ann3: ?Sent = null;
+    for (r.log.items) |s| if (!s.isQuery() and s.ifindex == 3 and s.to == .ip4) {
+        ann3 = s;
+    };
+    var echo_buf: [1500]u8 = undefined;
+    var echo = ann3.?;
+    @memcpy(echo_buf[0..echo.bytes.len], echo.bytes);
+    echo.bytes = echo_buf[0..echo.bytes.len];
+    try testing.expect(echo.find(.answer, hostName(), .a).?.cache_flush);
+    const t_ann = echo.now_us;
+    r.clearLog();
+    r.sink.clear();
+    const conflicts_before = r.e.stats().conflicts;
+
+    // Back on ifindex 4 from our own 10.0.3.1, 100 ms after the window.
+    r.sc.set(t_ann + timers.echo_window_us + 100 * ms_us);
+    r.e.handle(echo.bytes, .{ .from = own4, .ifindex = 4, .dst_multicast = true }, r.now());
+    try testing.expectEqual(@as(u64, 0), r.e.stats().rx_echo);
+    try testing.expectEqual(@as(u64, 0), r.e.stats().rx_echo_bridged);
+    try testing.expectEqual(conflicts_before, r.e.stats().conflicts);
+    // The documented cost: our own host A is now in our cache like a
+    // peer's (its TTL expiry is the only deadline).
+    var host = hostName();
+    try testing.expectEqual(@as(usize, 1), r.e.querier.cache.countLive(&host, .a, wire.class_in));
+    try testing.expect(r.e.nextDeadline(r.now()).? > r.now() + 100 * s_us);
+    // No re-announce, no defence, no rename: nothing goes out for the
+    // next five seconds.
+    try r.advance(5 * s_us);
+    try testing.expectEqual(@as(usize, 0), r.log.items.len);
+    try r.sink.expectCount(.host_renamed, 0);
+    try r.sink.expectCount(.renamed, 0);
+    // The datagram is not in `rx_echo`: it went through the parse and
+    // dispatch path like any peer's response.
+    try testing.expectEqual(@as(u64, 1), r.e.stats().rx);
 }
 
 test "SRV TTL is 120 and PTR TTL is 4500" {
@@ -2084,6 +2145,54 @@ test "advertise then browse on a second engine resolves within 3 simulated secon
     // own packet came back as an echo on both engines.
     try testing.expect(r.sent(.{ .from_engine = 1, .kind = .query }) >= 2);
     for (r.engines[0..2]) |*e| try testing.expectEqual(e.stats().tx, e.stats().rx_echo);
+}
+
+test "byte-identical query from our own address is still answered" {
+    // Two programs on ONE host (plan section 4.8, own-echo rule): both
+    // engines carry the same Interface table (ifindex 3, 10.0.3.1/24,
+    // fe80::1) on one segment, so every packet of one reaches the other
+    // from the other's own address. Both browse the type; engine 0
+    // advertises it. Engine 1 starts after engine 0's announcements, so
+    // its only way to find engine 0 is an answer to its own queries,
+    // which are byte-identical to engine 0's (ID 0, one question, empty
+    // known-answer list): echo-ring match AND own source address, yet
+    // still answered. Before v0.1.1 engine 0 counted them in `rx_echo`
+    // and dropped them; engine 1 resolved only when its query happened
+    // to fall outside the window (qmesh "seeds joined=0").
+    const r = try LanRig.init(.{ .count = 2, .seed = 0x9b1e });
+    defer r.deinit();
+    try r.attachWith(0, 0, lanAddr4(0), 1);
+    _ = try r.advertiseOn(0, inst, port);
+    try r.runTo(3 * s_us);
+    try r.sinks[0].expectCount(.registered, 1);
+
+    // Both browses start together (two programs launched at once): the
+    // ladders run in lock-step, so every query of engine 1 lands within
+    // 100 ms of engine 0's own, inside any echo window.
+    try r.attachWith(1, 0, lanAddr4(0), 1);
+    r.lan.clearLog();
+    const t_browse = r.now();
+    _ = try r.engines[0].browse(svc_type, t_browse);
+    _ = try r.engines[1].browse(svc_type, t_browse);
+    try r.runTo(t_browse + 3 * s_us);
+
+    try r.sinks[1].expectCount(.found, 1);
+    try r.sinks[1].expectCount(.resolved, 1);
+    const res = r.sinks[1].first(.resolved).?.resolved;
+    try testing.expect(res.instance.eql(&instName()));
+    try testing.expectEqual(port, res.port);
+    try testing.expectEqual(@as(u32, 3), res.ifindex);
+    // Engine 1's queries were counted as echoes by engine 0 (same bytes,
+    // own address) and answered anyway; engine 0 still found nothing and
+    // saw no conflict.
+    try testing.expect(r.sent(.{ .from_engine = 1, .kind = .query }) >= 2);
+    try testing.expect(r.sent(.{ .from_engine = 0, .kind = .response }) >= 1);
+    try testing.expect(r.engines[0].stats().rx_echo_answered >= 1);
+    try r.sinks[0].expectCount(.found, 0);
+    try r.sinks[0].expectCount(.renamed, 0);
+    try r.sinks[0].expectCount(.host_renamed, 0);
+    try testing.expectEqual(@as(u64, 0), r.engines[0].stats().conflicts);
+    try testing.expectEqual(@as(u64, 0), r.engines[1].stats().conflicts);
 }
 
 test "withdraw sends goodbye and the browser emits lost within 1s" {

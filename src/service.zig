@@ -314,7 +314,12 @@ pub const Service = struct {
         max_addrs_per_iface: u8 = events.max_addrs_per_family,
         /// `refreshInterfaces` cadence inside `tick` / `step`.
         iface_refresh_ms: u32 = 30_000,
-        /// Mode A: minimum gap between socket drains.
+        /// Mode A: minimum gap between socket drains. Own-echo recognition
+        /// needs the tick cadence plus this value well under
+        /// `timers.echo_window_us` (1 s): a looped-back datagram waits in
+        /// the socket for a tick gap plus this long, and an echo older
+        /// than the window is read as a peer's packet (`Service.tick`).
+        /// Keep it at or below ~100 ms.
         rx_poll_interval_us: u64 = 5_000,
     };
 
@@ -791,7 +796,12 @@ pub const Service = struct {
         return n;
     }
 
-    /// The current interface table.
+    /// The current interface table, the `local` argument of
+    /// `Resolved.preferred`, `SeedSet.accept` and `studio.dialCandidate`.
+    /// The slice aliases the Service's own table and is valid only until
+    /// the next `tick`, `step`, `run`, `lookup` or `refreshInterfaces`,
+    /// which rewrite it in place (contents and length): call it at the
+    /// point of use, as the integration snippets do; never keep the slice.
     pub fn interfaces(s: *const Service) []const Interface {
         return s.table.slice();
     }
@@ -966,7 +976,13 @@ pub const Service = struct {
 
     /// Mode A: the embedder's clock is authoritative. Applies queued
     /// mutations, drains the sockets when `shouldDrain` says so, ticks the
-    /// Engine, sends, runs the interface refresh on its cadence.
+    /// Engine, sends, runs the interface refresh on its cadence. Tick at
+    /// least every ~500 ms: an own echo is recognised only within
+    /// `timers.echo_window_us` (1 s) of the send, and a tick gap plus
+    /// `rx_poll_interval_us` is how long a looped-back datagram waits in
+    /// the socket. A missed echo of our own response is not a conflict
+    /// (identical rdata), but an advertise-and-browse node would cache
+    /// itself and a bridged echo would lose its re-announce.
     pub fn tick(s: *Service, now_us: u64) TickError!void {
         s.bindMode(.tick);
         s.advanceClock(now_us);

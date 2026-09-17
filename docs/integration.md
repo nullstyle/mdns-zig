@@ -46,7 +46,12 @@ method belongs to that thread. The mdns `Service` joins it.
 `tick` touches the sockets only when `rx_poll_interval_us` (default
 5000) has passed since the last drain, or when an RFC timer is due. A 1 ms
 caller therefore pays two zero-timeout receives every 5 ms, not every
-millisecond. Leave the default.
+millisecond. Leave the default. Own-echo recognition needs the tick
+cadence plus `rx_poll_interval_us` well under `timers.echo_window_us`
+(1 s): tick at least every ~500 ms and keep the option at or below
+~100 ms, or a looped-back response ages out of the echo ring in the
+socket and is read as a peer's (shared-studio's 1 ms and qmesh's 5 ms
+cadences are far inside that).
 
 ### Advertise
 
@@ -91,12 +96,15 @@ while (true) {
     for (evs[0..n]) |ev| switch (ev) {
         .resolved => |r| {
             const p = mdns.profiles.studio.Parsed.parse(&r) catch continue;
-            const addr = mdns.profiles.qmesh.pickAddr(&r) orelse continue;
+            // Ranked against this host's own interface table: the peer's
+            // address on the link we share beats its VM-bridge or VPN
+            // address (0.1.1). `c.rank` orders a ring of candidates.
+            const c = mdns.profiles.studio.dialCandidate(&r, svc.interfaces()) orelse continue;
             // Copy values into the mutex-guarded snapshot the UI reads
             // (`macos.m` statsMutex). `p.spki` is the value for
-            // `Config.expected_peer_spki`; `addr` formats as the
+            // `Config.expected_peer_spki`; `c.addr` formats as the
             // `peer_host:peer_port` literal with "{f}".
-            snapshot.setPeer(r.instance.firstLabel() orelse "", p, addr);
+            snapshot.setPeer(r.instance.firstLabel() orelse "", p, c.addr, c.rank);
         },
         .lost => |l| snapshot.clearPeer(l.instance.firstLabel() orelse ""),
         .warning => |w| if (w == .no_packets_10s) snapshot.noteLocalNetworkBlocked(),
@@ -105,16 +113,29 @@ while (true) {
 }
 ```
 
-`pickAddr` belongs to the qmesh profile but its rule is generic: IPv4
-first, then a global IPv6, then a scoped link-local IPv6, never an
-unscoped `fe80::`. shared-studio dials through qmsg, whose endpoint parser
-rejects `%zone`, so skip a `.ip6` address that is link-local
-(`addr.ip6.isLinkLocal()`) or format only `.ip4` results.
+`studio.dialCandidate` is `Resolved.preferred` (see below) minus
+link-local IPv6: shared-studio dials through qmsg, whose endpoint parser
+rejects `%zone`. `studio.dialAddress` is the same without the rank.
 
 `Resolved.instance` is the full name `Alice._shared-studio._udp.local`;
 `firstLabel()` gives the display name back. A `resolved` arrives once per
-`(instance, interface)`; a two-interface Mac sees two. Key the snapshot
-by instance and keep the newest.
+`(instance, interface)`; a two-interface Mac sees two, a Mac with a Lima
+bridge and a VPN sees four, and the first to arrive may carry an
+address this host cannot dial (the bridge's `192.168.215.0`). Key the
+snapshot by instance, and let a later `resolved` replace the dial
+address only when `c.betterThan(previous)` (keep the previous
+`Preferred`, not just its rank: `betterThan` is the one comparison that
+holds with or without a table): a candidate ring (shared-studio's
+`network.zig` endpoint ring) puts the best-ranked address at
+`endpoint_index` and keeps the rest as fallbacks for `nextEndpoint` to
+rotate through on a dial failure. Equal-ranked candidates are not
+"better", so they keep first-arrival order: on this Mac `bridge100`
+(192.168.139.3, a real host address on a local /24) ranks
+`on_link_same_if` exactly like en0's 192.168.1.75, and whichever
+`resolved` lands first stays at `endpoint_index`. A consumer bound to
+one specific local address should prefer the candidate whose arrival
+`r.ifindex` owns that bound address (`svc.interfaces()[i].index`); the
+ranking has no such tie-break yet.
 
 Replace `--peer host:port --expect <spki hex>` with `--discover
 <instance>`: the browse fills `peer_host`, `peer_port` and
@@ -156,7 +177,9 @@ so a seed found now is not joined again in a second by `on_iteration`:
 
 ```zig
 var seeds: mdns.profiles.qmesh.SeedSet = .{};
-for (found[0..n]) |*r| if (seeds.accept(r)) |c| joinContact(runner, c);
+// Before `boot.deinit()`: its interface table ranks the addresses (the
+// mode-A Service below reports the same table, so either one serves).
+for (found[0..n]) |*r| if (seeds.accept(r, boot.interfaces())) |c| joinContact(runner, c);
 ```
 
 ### The glue into `qmesh.Addr`
@@ -181,6 +204,14 @@ which `Addr.ipv6` drops. Until qmesh-zig gains `Addr.fromIp` (M6), skip
 those: `if (c.addr == .ip6 and c.addr.ip6.isLinkLocal()) return;`.
 `pickAddr` only returns one when the peer has no IPv4 and no global IPv6.
 
+`joinContact` may run twice for one `id` (0.1.1, see "Re-admission"
+below). In qmesh-zig that is safe: a second `Endpoint.startJoin` for an
+id overwrites the pending join's contact and re-emits the connect
+effect; `connectPeer` is a no-op while a session to that id is
+established or a dial to it is in flight, and the join-retry tick after
+a failed dial uses the updated contact, so the better address is dialed
+once the bad one times out.
+
 ### Continuous browse in `on_iteration`
 
 ```zig
@@ -197,7 +228,7 @@ const Glue = struct {
             if (n == 0) break;
             for (evs[0..n]) |ev| {
                 if (ev != .resolved) continue;
-                if (g.seeds.accept(&ev.resolved)) |c| joinContact(r, c);
+                if (g.seeds.accept(&ev.resolved, g.svc.interfaces())) |c| joinContact(r, c);
             }
         }
     }
@@ -217,12 +248,44 @@ const reg = try glue.svc.advertise(ad.desc());
 // Runner.Options: .on_iteration = Glue.onIteration, .on_iteration_ctx = &glue
 ```
 
-`SeedSet.accept` returns one `Contact` per `(id, epoch)`. A `resolved`
-re-emitted because the peer's address set changed is not a new contact.
-A `resolved` re-emitted with a new `epoch` is: the peer restarted and
-called `updateTxt`, and qmesh must join it again. `accept` also rejects
-adverts that fail `Parsed.parse` and adverts with no dialable address;
-`seeds.stats` counts each case.
+`SeedSet.accept` returns one `Contact` per `(id, epoch)`, plus one more
+each time a later `resolved` for that pair carries a strictly
+better-ranked address. A `resolved` re-emitted because the peer's
+address set changed is a new contact only if it ranks better. A
+`resolved` re-emitted with a new `epoch` always is: the peer restarted
+and called `updateTxt`, and qmesh must join it again. `accept` also
+rejects adverts that fail `Parsed.parse` and adverts with no dialable
+address; `seeds.stats` counts each case (`readmitted` for the
+re-admissions).
+
+**Re-admission (0.1.1).** A multi-homed peer yields one `resolved` per
+interface it was heard on. On a Mac with a Lima bridge the first to
+arrive can be the bridge's, whose only address is `192.168.215.0` (the
+subnet base, undialable), or a VPN interface's tunnel address, and a
+first-wins `SeedSet` joined that address (observed: B joined A at
+`192.168.215.0:4471` while A listened on `192.168.1.75`, and the session
+came up only because A dialed back). `accept` now ranks the address
+against `local`, this host's `Service.interfaces()`, with
+`Resolved.preferred`: on-link with the arrival interface's prefix, on-link
+with any local prefix, global IPv6, an IPv4 on a foreign subnet, a scoped
+link-local; the network base of a local prefix is never dialable. Pass
+`&.{}` to keep the old v4-first order with no re-admission by rank. The
+consumer must tolerate a second `Contact` for the same `id` (the
+`startJoin` semantics above). Re-admission needs a STRICTLY better rank:
+two on-link interfaces of the peer (on this Mac `bridge100`'s
+192.168.139.3 and en0's 192.168.1.75 both rank `on_link_same_if` when
+heard on their own interface) keep first-arrival order, and a qmesh
+node bound to one of those addresses should prefer the `Contact` whose
+`ifindex` owns its bound address; the set has no such tie-break yet.
+
+Open item for the qmesh-zig bump (not an mdns change): "dialed once the
+bad one times out" is the QUIC handshake timeout of the in-flight dial
+(`connectPeer` returns early while a session to that id is
+`.connecting`, `endpoint.zig`) plus the next 2 s join retry
+(`hyparview.zig` `join_timeout_us`), which can be many seconds. On a
+re-admitted `Contact` (a strictly better `rank` for an id already
+joining) qmesh can drop the `.connecting` session to that id before
+`startJoin` so the better address is dialed at once.
 
 The advertiser side of an epoch change:
 
@@ -266,7 +329,7 @@ while (true) {
         if (ev != .resolved) continue;
         const r = &ev.resolved;
         const p = mdns.profiles.qmsg.Parsed.parse(r) catch continue;
-        const addr = mdns.profiles.qmesh.pickAddr(r) orelse continue;
+        const addr = r.preferredAddress(svc.interfaces()) orelse continue; // ranked against our own interfaces (0.1.1)
         if (addr == .ip6 and addr.ip6.isLinkLocal()) continue; // parseEndpoint rejects %zone
         var lit: [64]u8 = undefined;
         const endpoint = try std.fmt.bufPrint(&lit, "{f}", .{addr}); // "10.0.0.5:4433" or "[2a01::7]:4433"
@@ -414,6 +477,9 @@ mdns.profiles.qmsg.Advert.init(.{ .instance, .port, .spki, .sn, .pat })     .des
 mdns.profiles.qmesh.Advert.init(.{ .instance, .port, .id, .epoch })         .desc() .txt() .setEpoch()
 mdns.profiles.studio.Advert.init(.{ .instance, .port, .spki, .epoch, .role }) .desc() .txt() .setEpoch() .setRole()
 mdns.profiles.{qmsg,qmesh,studio}.Parsed.parse(&resolved) ParseError!Parsed
-mdns.profiles.qmesh.SeedSet .accept(&resolved) ?Contact   .forget(id)   .clear()   .stats
-mdns.profiles.qmesh.pickAddr(&resolved) ?Io.net.IpAddress
+mdns.profiles.qmesh.SeedSet .accept(&resolved, svc.interfaces()) ?Contact   .forget(id)   .clear()   .stats
+mdns.profiles.qmesh.pickAddr(&resolved, local) ?Io.net.IpAddress
+mdns.profiles.studio.dialCandidate(&resolved, local) ?Preferred   .dialAddress(&resolved, local) ?Io.net.IpAddress
+resolved.preferredAddress(svc.interfaces()) ?Io.net.IpAddress   resolved.preferred(local) ?Preferred{addr, rank: AddrRank}
+svc.interfaces() []const Interface
 ```

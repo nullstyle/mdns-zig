@@ -1,6 +1,6 @@
 # Design
 
-This document describes mdns-zig v0.1.0 as built. Where the code differs
+This document describes mdns-zig v0.1.1 as built. Where the code differs
 from the plan (`mdns-zig-plan.md`), this document follows the code. The
 last section lists every such difference.
 
@@ -61,7 +61,10 @@ do not take a clock. Section 3.4 says how the Service stamps them.
 
 Ingress order in `handle`:
 
-1. Own-echo test (section 8.1). An echo is counted and goes no further.
+1. Own-echo test (section 10, "Own-echo recognition"). An echo is
+   counted; an echoed response or probe goes no further, an echoed plain
+   query (QR=0, empty Authority) continues and is answered like any
+   other (0.1.1).
 2. `wire.Message.parse`. Malformed input is `stats.dropped_malformed`.
 3. OPCODE or RCODE not zero is `stats.dropped_ignored` (§18.3, §18.11).
 4. A response (QR=1) from a source port other than 5353 is
@@ -293,6 +296,26 @@ holds at most 8 A and 8 AAAA. `Resolved.ttl_s` is the shortest remaining
 TTL among the records that built the value. A consumer that only needs a
 change signal compares the new value with its last copy.
 
+**Dial-address ranking (0.1.1).** A multi-homed responder yields one
+`resolved` per interface the browser heard it on, and the first may
+carry an address the browser cannot reach: a macOS VM bridge answers
+with its `192.168.215.0` (the subnet's network base), a VPN interface
+with its tunnel address. `Resolved.preferredAddress(local)` (and
+`preferred`, which adds the `AddrRank`) picks the best entry of `addrs`
+against the browser's own interface table, `Service.interfaces()`:
+on-link with a prefix of the interface the `resolved` arrived on, then
+on-link with any local prefix, then a global IPv6, then an IPv4 on no
+local prefix, then a scoped link-local IPv6; `0.0.0.0`, `::`, an
+unscoped `fe80::` and the network base of a local prefix are never
+returned. With an empty table nothing is on-link and IPv4 comes before
+global IPv6 (the pre-0.1.1 profile order). `profiles.qmesh.SeedSet`
+re-admits an `(id, epoch)` when a later `resolved` ranks strictly better
+(`stats.readmitted`), and `profiles.studio.dialCandidate` returns the
+rank so a candidate ring can order itself. Tests: `preferredAddress
+ranks on-link same-interface first`, `SeedSet re-admits a better address
+for the same id and epoch`, `studio profile ranks the dialable on-link
+address first`.
+
 **Rules on cached records.** Cache-flush (§10.2): a record with the
 cache-flush bit marks every other record of the same key that is older
 than 1 s to expire in 1 s. A record exactly 1 s old is kept. Goodbye
@@ -336,7 +359,7 @@ with its RFC section. The values below are the code's values.
 | `cache_flush_grace_us` | 1 s | §10.2 |
 | `goodbye_grace_us` | 1 s | §10.1 |
 | `conflict_backoff_count`, `conflict_backoff_window_us`, `conflict_backoff_delay_us` | 15 conflicts in 10 s gives 5 s | §9 |
-| `echo_window_us` | 2 s (own-echo ring) | plan §4.8 |
+| `echo_window_us` | 1 s (own-echo ring; the plan said 2 s, 0.1.1 sized it from bridge latency + the mode-B step cap + the mode-C mailbox wait, see `timers.zig`) | plan §4.8 |
 
 The §5.2 ladder sends queries at 0, 1, 3, 7, ..., 4095 s and then every
 3600 s. That is 13 queries while doubling and 22 more in the rest of the
@@ -448,14 +471,38 @@ send-window toggle needs no lock for the same reason: one thread.
 
 - **Own-echo recognition.** Multicast loopback is on, so our own packets
   come back. A datagram is an echo only when both tests pass: its digest
-  is in the 32-entry ring of recently sent datagrams within 2 s, AND its
-  source address is one of our own interface addresses. The digest alone
-  is not enough. Multicast query IDs are zero (§18.1), so a peer's first
-  browse query for the same type with an empty known-answer list is
-  byte-identical to ours, and it must be answered. The source test alone
-  is not enough either. mDNSResponder and avahi send from the same IP and
-  their packets can be real conflicts. Same IP with different rdata is a
-  real conflict.
+  is in the 32-entry ring of recently sent datagrams within
+  `echo_window_us` (1 s), AND its source address is one of our own
+  interface addresses. The digest alone is not enough. Multicast query
+  IDs are zero (§18.1), so a peer's first browse query for the same type
+  with an empty known-answer list is byte-identical to ours, and it must
+  be answered. The source test alone is not enough either. mDNSResponder
+  and avahi send from the same IP and their packets can be real
+  conflicts. Same IP with different rdata is a real conflict.
+- **Same-host echo (0.1.1).** Both tests together still pass for a second
+  program on this host that browses the same type: its query is
+  byte-identical to ours and comes from our own address. Dropping it left
+  that program unanswered (qmesh's `seeds joined=0`, `rx_echo` counting
+  the peer's lookup queries). So an echo stops only a response or a probe
+  (Authority section present): those carry our own records and must not
+  be cached as a peer's or read as a conflict. A plain query is counted
+  in `rx_echo` and `rx_echo_answered` and goes through the responder. The
+  cost is answering our own ladder queries when we browse a type we
+  advertise: our own response is echo-dropped, so it never enters our
+  cache or our known-answer list, and every ladder step gets an answer,
+  about 36 packets per pair per day, under the 1 s rate rule. The window
+  shrank from 2 s to 1 s at the same time (`timers.echo_window_us`
+  derives it: an echo is recognised only while bridge latency (a Wi-Fi
+  AP's DTIM hold, 100-300 ms) + the 250 ms mode-B step cap + mode C's
+  250 ms mailbox wait stays under the window; a mode-A embedder must
+  tick at least every ~500 ms with `rx_poll_interval_us` at or below
+  ~100 ms). The window no longer decides whether a query is answered,
+  only whether a response or a probe is ours; an echo later than the
+  window is parsed as a cooperating peer's packet: identical rdata, so
+  never a conflict, but a late bridged announcement echo does not fire
+  the re-announce below and its records enter our cache as a peer's.
+  Tests: `byte-identical query from our own address is still answered`,
+  `late bridged echo is a peer response, not a conflict`.
 - **Bridged echo.** An echo that arrives on an interface other than the
   one whose address it carries is counted in `rx_echo_bridged`. When it
   carried cache-flush A/AAAA for our host, the responder re-announces the
@@ -626,3 +673,9 @@ Each line names the revision that recorded it.
   policy") is not implemented; the ladder restarts as QM.
 - Code: probe defence keeps a 250 ms interval per pair (§6 last
   paragraph) instead of a blanket exemption from the rate rule.
+- 0.1.1: the own-echo window is 1 s, not the plan's 2 s, and a plain
+  query that passes both echo tests is still answered (section 10,
+  "Same-host echo"); `Stats.rx_echo_answered` counts them.
+- 0.1.1: `SeedSet.accept` takes the local interface table and emits a
+  second `Contact` for an `(id, epoch)` when a strictly better-ranked
+  address arrives (plan §5 flow 2 said at most one).

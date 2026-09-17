@@ -219,7 +219,157 @@ pub const Resolved = struct {
     /// Shortest remaining TTL among the SRV, TXT, A and AAAA records that
     /// built this value.
     ttl_s: u32,
+
+    /// The best entry of `addrs` for dialing, with `port` attached (and
+    /// the original scope on a v6 address), or null when no entry is
+    /// usable. `local` is the browser's own interface table
+    /// (`Service.interfaces()`); see `rankAddress` for the order. On a
+    /// multi-homed responder a browser gets one `Resolved` per interface
+    /// it heard the responder on, and the first one may carry an address
+    /// the browser cannot reach (a VM bridge, a VPN); this picks the
+    /// reachable one, and `preferred` tells a consumer whether a later
+    /// `Resolved` improved on an earlier choice.
+    pub fn preferredAddress(r: *const Resolved, local: []const Interface) ?Io.net.IpAddress {
+        const p = r.preferred(local) orelse return null;
+        return p.addr;
+    }
+
+    /// `preferredAddress` with its rank. Ties keep the first entry in
+    /// `addrs` order (A records before AAAA, as the Engine fills them).
+    pub fn preferred(r: *const Resolved, local: []const Interface) ?Preferred {
+        var best: ?Preferred = null;
+        for (r.addrs.slice()) |a| {
+            const rank = rankAddress(a, r.ifindex, local);
+            if (rank == .unusable) continue;
+            const candidate: Preferred = .{ .addr = withPort(a, r.port), .rank = rank, .key = rankKey(rank, local.len != 0) };
+            if (best) |b| {
+                if (!candidate.betterThan(b)) continue;
+            }
+            best = candidate;
+        }
+        return best;
+    }
+
+    fn withPort(a: Io.net.IpAddress, port: u16) Io.net.IpAddress {
+        return switch (a) {
+            .ip4 => |v| .{ .ip4 = .{ .bytes = v.bytes, .port = port } },
+            .ip6 => |v| .{ .ip6 = .{ .bytes = v.bytes, .port = port, .interface = v.interface } },
+        };
+    }
 };
+
+/// How dialable one address of a `Resolved` is from this host, best
+/// first (`rankAddress`). Lower is better.
+pub const AddrRank = enum(u8) {
+    /// Inside a prefix of the local interface the `Resolved` arrived on:
+    /// the responder answered on the link we share with it.
+    on_link_same_if = 0,
+    /// Inside a prefix of some other local interface (heard across a
+    /// bridge, or the arrival interface was unknown).
+    on_link = 1,
+    /// A global or ULA IPv6 address on no local prefix: may route.
+    global_v6 = 2,
+    /// An IPv4 address on no local prefix: a foreign subnet, reachable
+    /// only through a router.
+    any_v4 = 3,
+    /// `fe80::/10` with its scope set: dialable only by a consumer that
+    /// can carry a zone (qmesh `Addr` and the qmsg endpoint parser
+    /// cannot).
+    scoped_ll = 4,
+    /// Never returned by `preferred`: `0.0.0.0`, `::`, an unscoped
+    /// `fe80::`, or the network base of a local prefix (host bits all
+    /// zero, such as the `192.168.215.0` a macOS VM bridge carries).
+    unusable = 255,
+
+    /// The with-table order above, as the enum declares it. To compare
+    /// two dial candidates use `Preferred.betterThan`, which also holds
+    /// in table-less mode (where `any_v4` and `global_v6` swap, see
+    /// `rankKey`); this is the raw order only.
+    pub fn better(a: AddrRank, b: AddrRank) bool {
+        return @backingInt(a) < @backingInt(b);
+    }
+};
+
+/// The comparable form of `rank` (lower is better) for a candidate
+/// ranked with (`has_table`) or without a local interface table. With
+/// no table nothing is known to be on-link, and IPv4 outranks a global
+/// IPv6 (the pre-0.1.1 profile order: every consumer parses a v4
+/// literal, and v6 privacy addresses rotate faster than the AAAA TTL);
+/// with a table an IPv4 on no local prefix is a foreign subnet, and a
+/// global IPv6 that may route beats it. `Resolved.preferred` stores the
+/// result in `Preferred.key`, so `betterThan` needs no table argument.
+pub fn rankKey(rank: AddrRank, has_table: bool) u8 {
+    if (!has_table) switch (rank) {
+        .any_v4 => return @backingInt(AddrRank.global_v6),
+        .global_v6 => return @backingInt(AddrRank.any_v4),
+        else => {},
+    };
+    return @backingInt(rank);
+}
+
+/// One dial candidate out of a `Resolved`.
+pub const Preferred = struct {
+    addr: Io.net.IpAddress,
+    /// How `addr` ranked (`rankAddress`); for logging and for the
+    /// `scoped_ll` filter, not for ordering.
+    rank: AddrRank,
+    /// `rankKey(rank, local.len != 0)` as `preferred` computed it: the
+    /// one comparable form, valid whether or not a table was passed.
+    key: u8,
+
+    /// Strictly better than `other`: the canonical comparison between
+    /// two candidates, with or without a local table (both must have
+    /// been ranked the same way, which one `Service` guarantees). Ties
+    /// are not better: equal-ranked candidates keep first-arrival order.
+    pub fn betterThan(p: Preferred, other: Preferred) bool {
+        return p.key < other.key;
+    }
+};
+
+/// Rank `a` against the local interface table for a `Resolved` heard
+/// on `arrival_ifindex` (`Resolved.preferred`). Link-local v6 is never
+/// "on-link" here even though RFC 6762 section 11 treats it so: it
+/// needs a zone to dial, which the workspace consumers cannot carry.
+pub fn rankAddress(a: Io.net.IpAddress, arrival_ifindex: u32, local: []const Interface) AddrRank {
+    switch (a) {
+        .ip4 => |v| {
+            if (std.mem.allEqual(u8, &v.bytes, 0)) return .unusable;
+            var best: AddrRank = .any_v4;
+            for (local) |*i| {
+                for (i.v4.slice()) |p| {
+                    if (!p.contains(v.bytes)) continue;
+                    if (isNetworkBase4(p, v.bytes)) return .unusable;
+                    const r: AddrRank = if (i.index == arrival_ifindex) .on_link_same_if else .on_link;
+                    if (r.better(best)) best = r;
+                }
+            }
+            return best;
+        },
+        .ip6 => |v| {
+            if (std.mem.allEqual(u8, &v.bytes, 0)) return .unusable;
+            if (isLinkLocal6(v.bytes)) return if (v.interface.index != 0) .scoped_ll else .unusable;
+            var best: AddrRank = .global_v6;
+            for (local) |*i| {
+                for (i.v6.slice()) |p| {
+                    if (p.isLinkLocal() or !p.contains(v.bytes)) continue;
+                    const r: AddrRank = if (i.index == arrival_ifindex) .on_link_same_if else .on_link;
+                    if (r.better(best)) best = r;
+                }
+            }
+            return best;
+        },
+    }
+}
+
+/// `ip` is the all-zero-host-bits address of `p`'s subnet (never a
+/// host on a prefix shorter than /31; RFC 3021 makes both addresses of a
+/// /31 hosts, and a /32 is one host).
+fn isNetworkBase4(p: Prefix4, ip: [4]u8) bool {
+    if (p.prefix_len >= 31) return false;
+    const bits: u32 = std.mem.readInt(u32, &ip, .big);
+    const host_mask: u32 = if (p.prefix_len == 0) 0xffff_ffff else (@as(u32, 1) << @intCast(32 - p.prefix_len)) - 1;
+    return (bits & host_mask) == 0;
+}
 
 /// Non-fatal conditions (plan section 4.6, "Degrade"). Every payload is a
 /// value.
@@ -300,9 +450,17 @@ pub const Stats = struct {
     /// `Interface.v4_dropped + v6_dropped` (8 cap in `ifaces.zig`) plus
     /// `max_addrs_per_iface` drops, summed by `setInterfaces`.
     addrs_dropped: u64 = 0,
-    /// Our own datagrams looped back (digest in the echo ring AND source
-    /// address ours; plan section 4.8). Not processed further.
+    /// Datagrams that passed both own-echo tests (digest in the echo ring
+    /// within `timers.echo_window_us` AND source address ours; plan
+    /// section 4.8). Responses and probes go no further; a plain query
+    /// is still answered (see `rx_echo_answered`), because on one host a
+    /// peer program's byte-identical query arrives from our own address.
     rx_echo: u64 = 0,
+    /// The subset of `rx_echo` that was a plain query (QR=0, no
+    /// Authority) and went on to the responder: our own ladder queries
+    /// when we browse a type we advertise, and a same-host peer's
+    /// identical queries.
+    rx_echo_answered: u64 = 0,
     /// Own echoes that arrived on an interface other than the one whose
     /// address they carry (plan section 4.8 "Bridged echo").
     rx_echo_bridged: u64 = 0,

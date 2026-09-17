@@ -54,6 +54,12 @@ pub const Prefix6 = core.events.Prefix6;
 pub const Interface = core.events.Interface;
 pub const ServiceDesc = core.events.ServiceDesc;
 pub const Resolved = core.events.Resolved;
+/// Dial-address ranking against the local interface table (v0.1.1):
+/// `Resolved.preferredAddress(service.interfaces())`.
+pub const AddrRank = core.events.AddrRank;
+pub const Preferred = core.events.Preferred;
+pub const rankAddress = core.events.rankAddress;
+pub const rankKey = core.events.rankKey;
 pub const RegId = core.events.RegId;
 pub const BrowseId = core.events.BrowseId;
 pub const Family = core.events.Family;

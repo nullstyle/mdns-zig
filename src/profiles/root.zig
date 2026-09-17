@@ -39,6 +39,9 @@ pub const Txt = events.Txt;
 pub const TxtPair = events.TxtPair;
 pub const ServiceDesc = events.ServiceDesc;
 pub const Resolved = events.Resolved;
+pub const Interface = events.Interface;
+pub const AddrRank = events.AddrRank;
+pub const Preferred = events.Preferred;
 
 /// Every profile starts its TXT with `txtvers=1` (RFC 6763 section 6.7).
 pub const txtvers = "1";

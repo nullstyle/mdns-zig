@@ -25,7 +25,7 @@ give [qmsg](https://github.com/nullstyle/qmsg), qmesh and shared-studio
 peer discovery with fixed memory, bounded send budgets and no surprises
 from untrusted packets.
 
-What v0.1.0 does:
+What v0.1.x does:
 
 - Browse a service type and get `found` / `resolved` / `lost` events with
   host, port, addresses and TXT, one stream per interface. Records are
@@ -43,7 +43,7 @@ What v0.1.0 does:
 ## Installation
 
 ```sh
-zig fetch --save https://github.com/nullstyle/mdns-zig/archive/refs/tags/v0.1.0.tar.gz
+zig fetch --save https://github.com/nullstyle/mdns-zig/archive/refs/tags/v0.1.1.tar.gz
 ```
 
 Then in `build.zig`:
@@ -100,7 +100,9 @@ modes on the caller's thread, and binds to that mode's clock for life
 
 - **Tick-polled (mode A).** `Service.tick(now_us)` from your own loop with
   your own clock; sockets are drained at most every `rx_poll_interval_us`
-  (5 ms) or when an RFC deadline is due.
+  (5 ms) or when an RFC deadline is due. Tick at least every ~500 ms and
+  keep `rx_poll_interval_us` at or below ~100 ms: an own echo is
+  recognised only within `timers.echo_window_us` (1 s) of the send.
 - **Self-driven blocking (mode B).** `Service.step(cap)` does one bounded
   wait (cap <= 250 ms); `Service.run(shutdown, hook)` loops it until the
   atomic flips; `Service.lookup(type, opts, out)` is a bounded one-shot
@@ -135,7 +137,7 @@ clause to its status and the test that proves it. `zig build test` fails
 when a `done` row names a test that does not exist. Interop is scripted
 against `dns-sd` on macOS and avahi in the Lima VM (`interop/`).
 
-## Known limitations in v0.1.0
+## Known limitations in v0.1.x
 
 - No per-link re-probe when an interface is added: the new link gets the
   two announcements, and a name unique on the old link is assumed unique

@@ -19,11 +19,24 @@
 //! `updateTxt` forward to it.
 //!
 //! Ingress order in `handle`:
-//! 1. own echo: the datagram digest is in the echo ring (2 s window) AND
-//!    the source address is one of our interface addresses (plan section
-//!    4.8; both tests, never one). A bridged echo (arrival interface is
-//!    not the one that owns the source address) is noted for the M4
-//!    re-announce hook. Echoes count in `stats.rx_echo` and go no further.
+//! 1. own echo: the datagram digest is in the echo ring
+//!    (`timers.echo_window_us`, 1 s) AND the source address is one of
+//!    our interface addresses (plan section 4.8; both tests, never one).
+//!    A bridged echo (arrival interface is not the one that owns the
+//!    source address) is noted for the M4 re-announce hook. Echoes count
+//!    in `stats.rx_echo`. A response or a probe (Authority section
+//!    present) goes no further: our own records are never cached from an
+//!    echo and never read as a conflict. A plain query (QR=0, no
+//!    Authority) continues to step 2 and is answered like any other: on
+//!    one host a second program's browse query for the same type is
+//!    byte-identical to ours (ID 0, one question, empty known-answer list,
+//!    RFC 6762 section 18.1) AND comes from our own address, so both echo
+//!    tests pass for it; dropping it left that program unanswered
+//!    (v0.1.1, `byte-identical query from our own address is still
+//!    answered`). The price is answering our own ladder queries when we
+//!    browse a type we advertise (about 36 answers per pair per day, the
+//!    1 s rate rule and the known-answer list bound it); such answers
+//!    count in `stats.rx_echo_answered`.
 //! 2. `wire.Message.parse`: malformed -> `dropped_malformed`.
 //! 3. OPCODE != 0 or RCODE != 0 -> `dropped_ignored` (RFC 6762 sections
 //!    18.3, 18.11).
@@ -573,7 +586,12 @@ pub const Engine = struct {
                 if (meta.ifindex != 0 and meta.ifindex != sent_ifindex) {
                     e.onBridgedEcho(datagram, sent_ifindex, meta.ifindex, now_us);
                 }
-                return;
+                // A response or a probe stops here (conflict logic, no
+                // self-caching). A plain query is answered anyway: on one
+                // host a peer program's query can be byte-identical to
+                // ours and arrive from our own address (module doc, 1).
+                if (!isPlainQuery(datagram)) return;
+                e.counters.rx_echo_answered += 1;
             }
         }
 
@@ -623,6 +641,17 @@ pub const Engine = struct {
                 .on_link = on_link,
             }, now_us);
         }
+    }
+
+    /// QR=0 with an empty Authority section: a browse, resolve or
+    /// follow-up query, never a probe. Our own probes always carry the
+    /// proposed records in Authority (RFC 6762 section 8.1; the responder
+    /// emits `nscount != 0` for every probe), so an echoed probe still
+    /// stops at step 1 and never reaches the tie-break or defence paths.
+    /// A 12-byte header peek; no allocation.
+    fn isPlainQuery(datagram: []const u8) bool {
+        const h = wire.Header.parse(datagram) catch return false;
+        return !h.flags.qr and h.nscount == 0;
     }
 
     /// Plan section 4.8 "Port sharing": a unicast response is ours only

@@ -30,6 +30,13 @@
 //!   address) for ff02::fb, with `.interface = { .index = receiver ifindex }`,
 //!   port 5353. A unicast destination is routed to the one interface on
 //!   a connected segment that owns that address (`dst_multicast = false`).
+//! - Two engines may share one address on one segment (two programs on
+//!   one host, `byte-identical query from our own address is still
+//!   answered`): `addEngine` rejects a duplicate ifindex only within one
+//!   engine. Each then receives the other's multicast from what looks
+//!   like its own address (`Delivery.echo` is false: the sender is
+//!   another engine). A unicast to the shared address reaches only the
+//!   first interface that owns it, in attach order.
 //! - Loss is per segment (the sender's), drawn from a caller-supplied
 //!   seeded `std.Random`, and applies to deliveries over the link. The
 //!   in-host loopback echo is never lost (a real kernel loops the bytes

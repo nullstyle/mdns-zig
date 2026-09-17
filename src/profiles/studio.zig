@@ -8,15 +8,19 @@
 //! `spki` is the local certificate SPKI SHA-256 (`certificateSpki`);
 //! `epoch` is `Config.epoch`, the process incarnation musical events carry.
 //! A browser fills `Config.peer_host` / `peer_port` from the `Resolved`
-//! and `expected_peer_spki` from `Parsed.spki`; the mTLS handshake is the
-//! proof.
+//! (`dialAddress`, v0.1.1: ranked against the browser's own interface
+//! table) and `expected_peer_spki` from `Parsed.spki`; the mTLS
+//! handshake is the proof.
 const std = @import("std");
+const Io = std.Io;
 const profiles = @import("root.zig");
 
 const Txt = profiles.Txt;
 const TxtPair = profiles.TxtPair;
 const ServiceDesc = profiles.ServiceDesc;
 const Resolved = profiles.Resolved;
+const Interface = profiles.Interface;
+const Preferred = profiles.Preferred;
 
 pub const service_type = "_shared-studio._udp";
 pub const alpn = "qmsg/1";
@@ -137,6 +141,27 @@ pub const Parsed = struct {
         };
     }
 };
+
+/// The address a studio peer is dialed at, with the SRV port:
+/// `Resolved.preferred` against `local` (the browser's `Service.
+/// interfaces()`, or `&.{}` for the table-less v4-first order), minus
+/// link-local IPv6, which needs a `%zone` the qmsg endpoint parser
+/// rejects. Returns the rank too, so a consumer keeping a ring of dial
+/// candidates can order them best first and let a later `resolved`
+/// (another interface of a multi-homed peer) supersede an earlier,
+/// worse one: `candidate.betterThan(previous)` (the canonical
+/// comparison; `AddrRank.better` is the raw with-table order only).
+pub fn dialCandidate(resolved: *const Resolved, local: []const Interface) ?Preferred {
+    const p = resolved.preferred(local) orelse return null;
+    if (p.rank == .scoped_ll) return null;
+    return p;
+}
+
+/// `dialCandidate` without the rank.
+pub fn dialAddress(resolved: *const Resolved, local: []const Interface) ?Io.net.IpAddress {
+    const p = dialCandidate(resolved, local) orelse return null;
+    return p.addr;
+}
 
 test "studio advert renders the schema in order" {
     var a = try Advert.init(.{ .instance = "Alice", .port = 5000, .spki = @splat(0x01), .epoch = 0xfeed, .role = .conductor });

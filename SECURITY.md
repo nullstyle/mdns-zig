@@ -73,7 +73,14 @@ In scope:
   address + NSEC for one name, asserted under 2x). There is no per-source
   cap on those unicast replies beyond one per probe (a follow-up for M6);
   sending more than one reply per probe, or a multicast reply faster
-  than the 250 ms spacing, is in scope.
+  than the 250 ms spacing, is in scope. Since 0.1.1 a plain query (QR=0,
+  no Authority section) is answered even when it passes both own-echo
+  tests (its bytes match one of our recent queries and it comes from
+  one of our own addresses), because a second program on the same host
+  sends exactly that; a replay of our own query bytes from our own
+  address therefore gets the same answer any query gets, under the same
+  1 s per (record, interface, family) rule, so the answer budget above
+  is unchanged. Echoed responses and probes still stop at the echo test.
 
 Out of scope:
 

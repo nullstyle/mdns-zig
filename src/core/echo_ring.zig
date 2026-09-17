@@ -5,8 +5,8 @@
 //! back through `handle`. A datagram is an own echo only when BOTH tests
 //! pass:
 //!
-//!   1. its digest matches one recorded here within `echo_window_us`
-//!      (2 s), and
+//!   1. its digest matches one recorded here within `window_us`
+//!      (`timers.echo_window_us`, 1 s; the derivation is there), and
 //!   2. its source address is one of our own interface addresses.
 //!
 //! This file implements test 1 only. The caller (`Engine.handle`) ANDs it
@@ -16,7 +16,10 @@
 //! an empty known-answer list is byte-identical to ours and must still be
 //! answered. The source test alone is not enough either: mDNSResponder or
 //! avahi on the same host send from the same IP and can carry real
-//! conflicts.
+//! conflicts. And both tests together still pass for a same-host peer
+//! program's identical query (same bytes, our address), so the Engine
+//! answers a plain query even when it is an echo and stops only
+//! responses and probes (v0.1.1).
 //!
 //! No allocation: 32 inline entries, oldest overwritten.
 const std = @import("std");
@@ -25,11 +28,11 @@ const timers = @import("timers.zig");
 
 /// Number of digests kept. One browse per interface plus a few answers
 /// per second fit comfortably; an entry only has to survive the loopback
-/// round trip, which is well under the 2 s window.
+/// round trip, which is well under the window.
 pub const capacity: usize = 32;
 
 /// Window after `record` in which `matches` reports an echo (plan
-/// section 4.8; the same 2 s as `timers.echo_window_us`).
+/// section 4.8; `timers.echo_window_us`, 1 s).
 pub const window_us: u64 = timers.echo_window_us;
 
 /// Wyhash seed. Fixed: the digests never leave the process, and the
@@ -90,24 +93,24 @@ pub const EchoRing = struct {
 
 // ---- tests ------------------------------------------------------------
 
-test "echo ring matches within 2s" {
+test "echo ring matches within the window" {
     var ring: EchoRing = .empty;
     const pkt = "\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05_qmsg\x04_udp\x05local\x00\x00\x0c\x00\x01";
     try testing.expect(!ring.matches(pkt, 1_000_000));
     ring.record(pkt, 1_000_000);
     try testing.expect(ring.matches(pkt, 1_000_000));
     try testing.expect(ring.matches(pkt, 1_000_000 + 1));
-    try testing.expect(ring.matches(pkt, 1_000_000 + timers.s(1)));
-    try testing.expect(ring.matches(pkt, 1_000_000 + timers.s(2)));
+    try testing.expect(ring.matches(pkt, 1_000_000 + window_us / 2));
+    try testing.expect(ring.matches(pkt, 1_000_000 + window_us));
     try testing.expectEqual(@as(usize, 1), ring.count());
 }
 
-test "echo ring no match after 2s" {
+test "echo ring no match after the window" {
     var ring: EchoRing = .empty;
     const pkt = "abcdefgh";
     ring.record(pkt, 5_000_000);
-    try testing.expect(ring.matches(pkt, 5_000_000 + timers.s(2)));
-    try testing.expect(!ring.matches(pkt, 5_000_000 + timers.s(2) + 1));
+    try testing.expect(ring.matches(pkt, 5_000_000 + window_us));
+    try testing.expect(!ring.matches(pkt, 5_000_000 + window_us + 1));
     try testing.expect(!ring.matches(pkt, 5_000_000 + timers.s(60)));
     // The entry is still there; a fresh record of the same bytes matches
     // again.

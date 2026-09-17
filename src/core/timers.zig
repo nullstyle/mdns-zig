@@ -205,8 +205,38 @@ pub const conflict_backoff_delay_us: u64 = s(5);
 // ---- own-echo recognition ---------------------------------------------
 
 /// A datagram matches the echo ring only within this window after it was
-/// sent (plan section 4.8, own-echo rule: 2 s).
-pub const echo_window_us: u64 = s(2);
+/// sent (plan section 4.8, own-echo rule). The plan said 2 s; v0.1.1
+/// shrank it to 1 s, sized from the longest round trip an echo can take
+/// back into `handle`. The ring records at `pollDatagram` (the send)
+/// and is checked with the `now_us` the echo is handled at, so an echo
+/// is recognised only while
+///
+///     path latency + step cap + mailbox wait < echo_window_us
+///
+/// holds. Path latency: the OS loopback is well under a millisecond; a
+/// BRIDGED echo (the same datagram back on another interface, plan
+/// section 4.8) adds the bridge's own delay, and a Wi-Fi access point
+/// holds multicast until its next DTIM beacon, 100-300 ms. Step cap:
+/// mode B (`Service.step` / `run` / `lookup`) does one timed receive
+/// per step on one socket, capped at `service.max_step_cap_us`
+/// (250 ms), then a zero-duration drain of the other socket, so an
+/// echo that lands on the non-timed socket while nothing arrives on
+/// the timed one waits up to 250 ms plus the tick and the embedder's
+/// `run` hook. Mailbox wait: mode C's `serveLoop` blocks up to
+/// `max_step_cap_us` (250 ms) per event when the `Mailbox` is full
+/// before it drops the oldest, and the socket is not drained meanwhile.
+/// Worst case 300 + 250 + 250 = 800 ms, so 1 s. Mode A (`Service.tick`)
+/// ages an echo by the embedder's tick cadence plus
+/// `rx_poll_interval_us` (5 ms): an embedder must tick at least every
+/// ~500 ms for echoes to be recognised (qmesh ticks every 5 ms,
+/// shared-studio every 1 ms). Since v0.1.1 the window no longer decides
+/// whether a query is answered (`Engine.handle`, step 1), only whether
+/// a response or a probe is read as ours; an echo that arrives later
+/// than this is parsed as a cooperating peer's packet (identical rdata,
+/// so never a conflict; a late bridged announcement echo does not fire
+/// the section 10.2 re-announce and its records enter our cache as a
+/// peer's, test `late bridged echo is a peer response, not a conflict`).
+pub const echo_window_us: u64 = s(1);
 
 // ---- jitter and schedule helpers --------------------------------------
 
@@ -721,6 +751,6 @@ test "constant table matches plan section 4.4" {
     try testing.expectEqual(s(10), conflict_backoff_window_us);
     try testing.expectEqual(s(5), conflict_backoff_delay_us);
     try testing.expectEqual(s(2), qu_unicast_window_us);
-    try testing.expectEqual(s(2), echo_window_us);
+    try testing.expectEqual(s(1), echo_window_us);
     try testing.expectEqual(@as(u32, 4), requery_mark_count);
 }

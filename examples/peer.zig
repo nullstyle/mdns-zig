@@ -12,7 +12,7 @@
 //! exiting (the goodbye of RFC 6762 section 10.1, or the TTL otherwise):
 //!
 //! ```
-//! peer bob at 192.168.5.15:4433 ifindex 12
+//! peer bob at 192.168.5.15:4433 ifindex 12 rank=on_link_same_if
 //! peer bob gone
 //! ```
 //!
@@ -23,9 +23,14 @@
 //! and dropped. Mode B (`Service.run`) with signal handlers that only set
 //! an atomic; SIGINT / SIGTERM end the run and `deinit` sends the goodbye.
 //!
+//! The one address printed is `Resolved.preferredAddress` ranked
+//! against this process's own interface table (`svc.interfaces()`): on a
+//! multi-homed host the peer's address on the link we share beats its VM
+//! bridge or VPN address, and `rank=` says which it was (v0.1.1, B2).
+//!
 //! Flags: `<name>` (positional, required), `--port <n>` (default 4433),
 //! `--no-ipv6`, `--ifindex N` (repeatable), `--loopback`, `--all-addrs`
-//! (print every address instead of the first).
+//! (print every address instead of the preferred one).
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -147,7 +152,7 @@ const Peer = struct {
         while (true) {
             const n = svc.poll(&evs);
             if (n == 0) break;
-            for (evs[0..n]) |ev| try p.print(ev);
+            for (evs[0..n]) |ev| try p.print(ev, svc.interfaces());
         }
         try p.out.flush();
     }
@@ -166,24 +171,25 @@ const Peer = struct {
         p.my_label.appendSlice(label) catch {}; // labels are <= 63 by construction
     }
 
-    fn print(p: *Peer, ev: mdns.Event) !void {
+    fn print(p: *Peer, ev: mdns.Event, local: []const mdns.Interface) !void {
         const out = p.out;
         switch (ev) {
             .resolved => |r| {
                 if (p.isSelf(&r.instance)) return;
                 const label = r.instance.firstLabel() orelse return;
                 try out.print("peer {s} at ", .{label});
-                if (r.addrs.len == 0) {
-                    try out.writeAll("(no address)");
-                } else if (p.all_addrs) {
+                if (p.all_addrs) {
+                    if (r.addrs.len == 0) try out.writeAll("(no address)");
                     for (r.addrs.slice(), 0..) |a, i| {
                         if (i != 0) try out.writeByte(',');
                         try out.print("{f}", .{a});
                     }
+                    try out.print(" ifindex {d}\n", .{r.ifindex});
+                } else if (r.preferred(local)) |c| {
+                    try out.print("{f} ifindex {d} rank={t}\n", .{ c.addr, r.ifindex, c.rank });
                 } else {
-                    try out.print("{f}", .{r.addrs.slice()[0]});
+                    try out.print("(no dialable address) ifindex {d}\n", .{r.ifindex});
                 }
-                try out.print(" ifindex {d}\n", .{r.ifindex});
             },
             .lost => |l| {
                 if (p.isSelf(&l.instance)) return;
