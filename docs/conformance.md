@@ -39,55 +39,66 @@ scope (a user-interface rule, or behaviour delegated to the OS).
 
 | Clause | Requirement | Status | Test name |
 |---|---|---|---|
-| §5.1 | One-shot queries from an ephemeral port are accepted and answered as legacy queries | M4 | `legacy reply shape` |
+| §5.1 | One-shot queries from an ephemeral port are accepted and answered as legacy queries | done | `legacy reply shape` |
 | §5.2 | First query delayed 20-120 ms; interval starts at 1 s, doubles, caps at 60 min | done | `first query delayed 20-120ms`, `query intervals double and cap at 60min` |
 | §5.2 | Re-query at 80/85/90/95 % of TTL (+0-2 %) merged into the continuous schedule | done | `requery marks merge into one packet` |
 | §5.2 | Requery marks are armed from the resolve join, so they do not depend on the order records arrive in (SRV/TXT/A before the PTR, or the host's A a packet ahead of the SRV) | done | `reversed record order still schedules requery marks`, `host records that arrive before the service still get requery marks` |
 | §5.2 | Consecutive real query gaps keep the factor of two (the 0-2 % jitter compounds); a question that does not fit one tick's batch retries at the next tick instead of skipping a doubled step | done | `query intervals double and cap at 60min`, `a full due batch retries at the next tick instead of skipping a ladder step` |
 | §5.2 | Query budget over 24 h follows the schedule (35 queries per interface, +1 jitter) | M5 | `browse budget over 24h matches derived schedule` |
-| §5.3 | Multiple questions per query are parsed and answered independently | M4 | - |
+| §5.3 | Multiple questions per query are parsed and answered independently | done | `multi-question and ANY queries get one aggregated response with the section 12 additionals` |
 | §5.4 | New browse questions do not set QU; QU only for probes and the post-interface-add burst | done | `browse queries never set QU` |
-| §5.4 | A QU response is unicast unless the record was not multicast within TTL/4 | M4 | `QU reply multicast when not multicast within TTL/4` |
+| §5.4 | A QU response is unicast unless the record was not multicast within TTL/4 | done | `QU reply multicast when not multicast within TTL/4` |
+| §5.4 | The unicast-response bit is a per-question property: a query mixing QU and QM questions gets the QU part by unicast and the QM part by multicast; a record asked both ways goes by multicast once | done | `a query mixing QU and QM questions is answered per question` |
+| §5.5 | A query delivered by direct unicast to port 5353 is answered as a QU question would be | done | `direct unicast query is answered like QU` |
 | §5.4 | Unicast responses are accepted only within 2 s of our own QU query | done | `unicast outside 2s QU window discarded` |
 | §6 | Responses whose source UDP port is not 5353 are dropped and counted | done | `response from non-5353 source is ignored` |
-| §6 | Shared-record answers wait 20-120 ms; unique answers go immediately | M4 | `probe timing` |
-| §6 | A record is multicast at most once per second per interface, except probe defence | M4 | `record never multicast twice within 1s per interface except defence` |
+| §6 | Shared-record answers wait 20-120 ms; unique answers go immediately | done | `probe timing` |
+| §6 | A record is multicast at most once per second per interface, except probe defence; a query flood gets one answer a second per (interface, family) pair, unique and shared records alike, the rest dropped. The rate table is keyed by the egress (interface, family) pair rather than the bare interface of plan §4.4 / §4.8: a dual-stack link carries one copy per transport, and a v6-only querier never hears the v4 copy | done | `record never multicast twice within 1s per interface except defence`, `a query flood is answered at most once per second per pair` |
+| §6 | Probe defence is exempt from the one-second rule but keeps "an interval of at least 250 ms since the last time the record was multicast on that interface": a defence that comes too early is deferred to that moment (and later probes of the burst join it), so a probe flood for one of our names yields at most one defence per 250 ms per pair and every prober still hears one; `interop/probe_defence.py` checks it on the wire | done | `200 probes in 1 s yield at most 5 defence packets per pair` |
+| §6.7 | A legacy reply repeats every question of the query (up to 4) and is one conventional packet of at most 512 octets with TC set when the rest does not fit (RFC 1035 §4.2.1) | done | `legacy reply echoes every question and stays within 512 octets` |
 | §6 | Answers are sent on the interface the query arrived on; own echoes are recognised | done | `byte-identical query from a foreign source is not an echo` |
-| §6.1 | NSEC (restricted form) for any type absent under a name we own, per interface | M4 | `NSEC for any absent type under a unique name` |
+| §6.1 | NSEC (restricted form) for any type absent under a name we own, per interface | done | `NSEC for any absent type under a unique name` |
 | §6.1 | Restricted NSEC on the wire: a type over 255 is refused by `Nsec.set` ("MUST NOT generate these restricted-form NSEC records"), and the NSEC bit is never emitted in the Type Bit Map | done | `restricted NSEC refuses types over 255 and never sets the NSEC bit` |
-| §6.2 | Address answers carry every kept address of the sending interface only | M4 | `A answer contains only the sending interface's kept addresses` |
+| §6.2 | Address answers carry every kept address of the sending interface only | done | `A answer contains only the sending interface's kept addresses` |
+| §6.2 | On an interface with addresses of one family only, an address answer (and the RFC 6763 §12 address additionals) carries the NSEC that says the other family is absent | done | `A answer on a v4-only interface carries the NSEC for AAAA in additionals` |
 | §6.2 | At most 8 addresses per family per interface; v6 global first, link-local last; drops counted | M2 | `ninth v6 address per interface is dropped and reported in v6_dropped`, `v6 global addresses sort before link-local` |
 | §6.2 | Engine sums per-interface drops into `stats.addrs_dropped` and warns once | done | `setInterfaces sums Interface dropped counts into addrs_dropped and warns once` |
-| §6.3 | Multi-question queries get one aggregated response | M4 | - |
-| §6.4 | Pending answers are aggregated into one packet after the delay | M4 | - |
-| §6.5 | Wildcard (ANY) queries for our own names answer with every record we hold | M4 | - |
-| §6.6 | Identical rdata from another responder is cooperation, not a conflict | M4 | `identical rdata is not a conflict` |
+| §6.3 | Multi-question queries get one aggregated response | done | `multi-question and ANY queries get one aggregated response with the section 12 additionals` |
+| §6.4 | Pending answers are aggregated into one packet after the delay | done | `shared answers aggregate into one packet and TC delays 400-500ms` |
+| §6.5 | Wildcard (ANY) queries for our own names answer with every record we hold | done | `multi-question and ANY queries get one aggregated response with the section 12 additionals` |
+| §6.6 | Identical rdata from another responder is cooperation, not a conflict | done | `identical rdata is not a conflict` |
 | §6.7 | Legacy unicast reply: echo ID and question, TTL capped at 10 s, no cache-flush bit, no SRV compression, no NSEC next-name compression (a conventional unicast response, so RFC 4034 §4.1.1 applies) | done | `legacy builder never compresses SRV target` |
-| §6.7 | Legacy unicast reply shape end to end (ID, question echo, TTL cap, unicast destination) | M4 | `legacy reply shape` |
-| §7.1 | Known-answer list omits records at or past half TTL; KA records suppress our answer | M4 | `KA at half TTL suppresses` |
+| §6.7 | Legacy unicast reply shape end to end (ID, question echo, TTL cap, unicast destination) | done | `legacy reply shape` |
+| §7.1 | Known-answer list omits records at or past half TTL; KA records suppress our answer | done | `KA at half TTL suppresses` |
 | §7.1 | Records seen only in another querier's known-answer list are never cached | done | `KA records from other queriers not cached` |
-| §7.2 | TC bit on a query defers the answer 400-500 ms for the continuation packets | M4 | - |
+| §7.2 | TC bit on a query defers the answer 400-500 ms for the continuation packets | done | `shared answers aggregate into one packet and TC delays 400-500ms` |
+| §7.2 | Known answers in a later packet from the same querier (usually qdcount 0) are deleted from the answer still waiting for it on that pair; an answer left empty is dropped. Answers aggregated for two queriers are not trimmed | done | `TC continuation known answers suppress the deferred response` |
 | §7.3 | Duplicate question suppression when another querier asks the same question | M6 | - |
 | §7.4 | Duplicate answer suppression when another responder answers first | M6 | - |
-| §8.1 | Probe: 0-250 ms first delay, 3 probes 250 ms apart, qtype ANY, Authority section, QU when first binder | M4 | `probe timing` |
+| §8.1 | Probe: 0-250 ms first delay, 3 probes 250 ms apart, qtype ANY, Authority section, QU when first binder | done | `probe timing` |
 | §8.1 | A probe on the wire is a query with qtype ANY and the proposed records in the Authority section (captured mDNSResponder probes decode as such; QU is optional for a long-running host) | done | `fixture probes use qtype ANY with proposed records in authority` |
-| §8.1 | A probe from our own host or over a shared port is defended by multicast | M4 | `same-host probe is defended by multicast`, `shared port probe is defended by multicast` |
-| §8.2 | Simultaneous probe tie-break over lexicographically sorted record sets; the loser waits 1 s | M4 | `tie-break loser waits 1s` |
-| §8.3 | Announce twice, 1 s apart, with the cache-flush bit | M4 | `SRV TTL is 120 and PTR TTL is 4500` |
-| §8.4 | Updating a unique record re-announces without probing; identical rdata is a no-op | M4 | `updateTxt re-announces twice with cache-flush and never probes`, `updateTxt with identical rdata sends nothing`, `updateTxt during probing waits for the probe` |
-| §9 | A conflicting response re-probes the same name first; only a failed probe renames | M4 | `conflict after announce re-probes before renaming`, `probe failure after conflict renames`, `same-IP different rdata is a conflict` |
-| §9 | Host rename is `<label>-2`; instance rename is `Name (2)`; host rename re-announces SRV | M4 | `host rename to label-2 re-announces SRV` |
-| §9 | 15 conflicts in 10 s gives a 5 s backoff | M4 | `fifteen conflicts trigger backoff` |
-| §9 | Our own looped-back packets never trigger defence, rename or flush | M4 | `own echo via loopback never defends renames or flushes` |
-| §10 | TTL 120 s for host records (A, AAAA, SRV, NSEC), 4500 s for PTR and TXT | M4 | `SRV TTL is 120 and PTR TTL is 4500` |
+| §8.1 | A probe from our own host or over a shared port is defended by multicast; a second stack on our own IP hears the defence during its probe and renames | done | `same-host probe is defended by multicast`, `shared port probe is defended by multicast`, `a second stack on our own IP loses to the multicast defence and renames` |
+| §8.2 | Simultaneous probe tie-break over lexicographically sorted record sets; the loser waits 1 s; several hosts probing one name at once converge to distinct names inside a bounded packet budget | done | `tie-break loser waits 1s`, `simultaneous probers of one name converge to distinct names` |
+| §8 | "Link Change": probing AND announcing on a newly added or re-addressed interface. v0.1 announces twice there (§8.3) but does not re-probe per link: a name unique on the old link is assumed unique on the new one until a §9 conflict says otherwise | M6 | - |
+| §8.1, §10.1, §10.2 | An announcement queued for the host (interface change, bridged echo, rate-limit deferral) is not sent once the host is re-probing after a §9 conflict or has said goodbye with the last registration | done | `announce queued before a conflict or a withdraw is not sent` |
+| §8.3 | Announce twice, 1 s apart, with the cache-flush bit; 250 ms after the third probe (§8.1); also twice when an interface joins or changes its addresses ("Link Change") | done | `SRV TTL is 120 and PTR TTL is 4500`, `probe timing`, `bridged interfaces re-announce the echoed addresses and never rename` |
+| §8.4 | Updating a unique record re-announces without probing; identical rdata is a no-op | done | `updateTxt re-announces twice with cache-flush and never probes`, `updateTxt with identical rdata sends nothing`, `updateTxt during probing waits for the probe` |
+| §9 | A conflicting response re-probes the same name first; only a failed probe renames | done | `conflict after announce re-probes before renaming`, `probe failure after conflict renames`, `same-IP different rdata is a conflict` |
+| §9 | Host rename is `<label>-2`; instance rename is `Name (2)`; host rename re-announces SRV | done | `host rename to label-2 re-announces SRV` |
+| §9 | 15 conflicts in 10 s gives a 5 s backoff | done | `fifteen conflicts trigger backoff` |
+| §9 | A conflict while probing renames only once the current name was actually probed (a probe sent or a tie-break lost); a burst of conflicting responses inside the first-probe delay or the backoff is counted but renames once, so the visible name moves at the probe rate, not the packet rate | done | `conflicts before the first probe of a name rename it once` |
+| §11 | A unicast reply (legacy, QU) never goes to a source that is not on the arrival link: a legacy query from an off-link source is dropped and counted, a QU question from one is answered by multicast; a query from source port 0 is dropped and counted | done | `QU query from an off-link source is answered by multicast or dropped` |
+| §9 | Our own looped-back packets never trigger defence, rename or flush | done | `own echo via loopback never defends renames or flushes` |
+| §10 | TTL 120 s for host records (A, AAAA, SRV, NSEC), 4500 s for PTR and TXT | done | `SRV TTL is 120 and PTR TTL is 4500` |
 | §10 | Cache is bounded; eviction removes the soonest-expiring record first | done | `cache cap evicts soonest expiry` |
 | §10.1 | A goodbye on the wire is a response whose answer section carries the withdrawn records with TTL 0 (captured mDNSResponder goodbyes decode as such) | done | `fixture goodbye records have TTL 0` |
 | §10.1 | Goodbye (TTL 0) sets the cached TTL to 1 s; `lost` fires after that second | done | `goodbye removes after 1s` |
 | §10.1 | A goodbye for an instance's PTR, SRV or TXT stops its follow-up questions until a live record returns | done | `goodbye for SRV and PTR sends no follow-up queries` |
-| §10.1 | Withdrawing a registration or stopping the service sends goodbye packets | M5 | `serve returns Canceled after group.cancel and a peer sees goodbye` |
+| §10.1 | Withdrawing a registration sends one goodbye (TTL 0) per joined pair for its records, the host records go with the last registration, and `Service.deinit` flushes the goodbyes before it closes the sockets; the mode C proof is M5 | done | `withdraw sends a goodbye with TTL 0 and the host goes with the last registration` |
+| §10.1 | Goodbyes waiting on one pair share a packet, so `withdrawAll` needs one job per joined pair whatever the registration count and never drops a goodbye | done | `withdrawAll says goodbye for every registration on every pair` |
 | §10.2 | Cache-flush bit: records older than 1 s are flushed, younger ones kept | done | `cache-flush keeps records younger than 1s` |
 | §10.2 (with §6.2, §14) | The cache is keyed by `(name, type, class, ifindex)`: a cache-flush record flushes only records heard on the same interface, so a multi-homed responder's per-interface address RRSets (§6.2) coexist and a querier reports one `found` / `resolved` / `lost` per interface (§14, as `dns-sd -B` does per interfaceIndex). §10.2 itself does not name the interface; the scoping follows from §6.2 (each interface's answer is its own RRSet) and §14 ("discover on what interface a Multicast DNS response was received"), and mDNSResponder's per-InterfaceID cache | done | `cache-flush only flushes records from the same interface`, `multi-homed responder yields one stable resolved per interface`, `lost fires per interface`, `bridged segments report the same responder once per interface` |
-| §10.2 | A bridged echo of our address records triggers an immediate re-announce | M4 | `bridged echo re-announces address records` |
+| §10.2 | A bridged echo of our address records triggers an immediate re-announce of the arrival interface's address RRSet; the §6 one-second rule applies as a drop (the peers already hold both sets inside the flush grace), so the re-announces settle instead of bouncing across the bridge once a second | done | `bridged echo re-announces address records`, `bridged interfaces re-announce the echoed addresses and never rename` |
 | §10.3 | Cache flush on topology change (interface up/down) | M6 | - |
 | §10.4 | Cache flush on failure indication (application-driven requery) | M6 | - |
 | §10.5 | Passive observation of failures (POOF) | M6 | - |
@@ -103,11 +114,11 @@ scope (a user-interface rule, or behaviour delegated to the OS).
 | §16 | Cache keys and question matching compare names ASCII case-insensitively | done | `name compare is ASCII case-insensitive`, `same-data refresh does not re-emit resolved` |
 | §17 | Packets target 1472 B (v4) / 1452 B (v6); the hard cap is 9000 B including IP and UDP headers, so the payload cap is 8972 / 8952; a caller override can only lower the cap | done | `builder payload never exceeds 8972 v4 or 8952 v6` |
 | §17 | A single RR larger than the MTU target is sent alone in its own packet | done | `builder emits one RR when over MTU` |
-| §18.1 | Multicast queries carry ID 0; multicast responses carry ID 0; legacy responses echo the query ID | M4 | `legacy reply shape` |
+| §18.1 | Multicast queries carry ID 0; multicast responses carry ID 0; legacy responses echo the query ID | done | `legacy reply shape` |
 | §18.2 | QR distinguishes queries and responses; responses from non-5353 ports are dropped | done | `response from non-5353 source is ignored` |
 | §18.3 | OPCODE must be 0; other values are ignored | done | `engine handle counts malformed and bad-port drops` |
-| §18.4 | AA set on responses; ignored on receipt | M4 | - |
-| §18.5 | TC on queries means more known answers follow; on responses ignored | M4 | - |
+| §18.4 | AA set on responses; ignored on receipt | done | `multi-question and ANY queries get one aggregated response with the section 12 additionals` |
+| §18.5 | TC on queries means more known answers follow; on responses ignored | done | `shared answers aggregate into one packet and TC delays 400-500ms` |
 | §18.6-18.10 | RD, RA, Z, AD, CD are 0 on send and ignored on receipt | done | `engine ignores RD RA and Z on receipt and sends them clear` |
 | §18.11 | RCODE is 0 on send; non-zero RCODE packets are ignored | done | `engine handle counts malformed and bad-port drops` |
 | §18.12 | Top bit of qclass is the QU flag, split out on parse and set on build | done | `QU and cache-flush bits`, `QU and cache-flush bits round trip through the builder` |
@@ -120,12 +131,12 @@ scope (a user-interface rule, or behaviour delegated to the OS).
 
 | Clause | Requirement | Status | Test name |
 |---|---|---|---|
-| §4.1 | Instance names are UTF-8, 1-63 octets; the service type is `_svc._tcp` or `_svc._udp`; instance label is one label | M4 | - |
+| §4.1 | Instance names are UTF-8, 1-63 octets; the service type is `_svc._tcp` or `_svc._udp`; instance label is one label | done | `advertise validates the instance label and the service type` |
 | §4.2 | User-interface presentation of instance names | n/a | - |
 | §4.3 | Dots and backslashes inside an instance label are escaped in text form and stored raw on the wire | done | `escaping round trip` |
 | §6.1 | TXT rdata is one or more length-prefixed strings; an empty TXT is a single zero byte, on build and when the Builder re-emits an empty rdata | done | `empty TXT is a single zero byte`, `builder writes an empty TXT as a single zero byte` |
 | §6.2 | TXT rdata is at most 400 B on advertise and in events; larger is rejected or truncated and counted | done | `TXT over 400 B is rejected` |
-| §6.2 | `updateTxt` over 400 B is rejected and leaves the old TXT in place | M4 | `updateTxt over 400 B is rejected and keeps the old TXT` |
+| §6.2 | `updateTxt` over 400 B is rejected and leaves the old TXT in place | done | `updateTxt over 400 B is rejected and keeps the old TXT` |
 | §6.3 | Each string is `key=value` or a bare `key`; each string is at most 255 B | done | `build and iterate pairs`, `TXT string over 255 and bad keys are rejected` |
 | §6.3 | Captured TXT rdata decodes as `key=value` pairs with valid keys; the owned `Txt` copy agrees with the zero-copy view | done | `fixture TXT records parse as key=value` |
 | §6.4 | Keys are at least 1 char of printable ASCII without `=`; compared ASCII case-insensitively; first match wins | done | `TXT key lookup is case-insensitive` |
@@ -135,11 +146,11 @@ scope (a user-interface rule, or behaviour delegated to the OS).
 | §7 | Service names follow RFC 6335 §5.1; the transport label is `_tcp` or `_udp` | done | `service name rejects leading hyphen, double hyphen and all-digit` |
 | §7.1 | Subtypes (`_sub`) for selective instance enumeration | M6 | - |
 | §7.2 | Service name length at most 15 characters | done | `service name rejects leading hyphen, double hyphen and all-digit` |
-| §9 | `_services._dns-sd._udp.local` enumerates the service types we advertise | M4 | - |
-| §12.1 | PTR answers include the SRV, TXT and address records as additionals | M4 | - |
-| §12.2 | SRV answers include the target's A and AAAA records as additionals | M4 | - |
-| §12.3 | TXT answers carry no additionals | M4 | - |
-| §12.4 | Other record types carry no additionals | M4 | - |
+| §9 | `_services._dns-sd._udp.local` enumerates the service types we advertise | M6 | - |
+| §12.1 | PTR answers include the SRV, TXT and address records as additionals | done | `multi-question and ANY queries get one aggregated response with the section 12 additionals` |
+| §12.2 | SRV answers include the target's A and AAAA records as additionals | done | `multi-question and ANY queries get one aggregated response with the section 12 additionals` |
+| §12.3 | TXT answers carry no additionals | done | `multi-question and ANY queries get one aggregated response with the section 12 additionals` |
+| §12.4 | Other record types carry no additionals | done | `multi-question and ANY queries get one aggregated response with the section 12 additionals` |
 
 ## RFC 4034 - NSEC wire format (as used by RFC 6762 §6.1)
 
@@ -170,7 +181,8 @@ scope (a user-interface rule, or behaviour delegated to the OS).
 | plan §5 | `resolved` fires once SRV, TXT and an address are present, again on SRV, TXT or address-set change, never on a same-data refresh; `ttl_s` is the shortest RR TTL | done | `resolved is emitted once when SRV, TXT and an address are present`, `resolved re-emitted on TXT change`, `resolved re-emitted on SRV port change`, `resolved re-emitted when an address is added or expires`, `same-data refresh does not re-emit resolved`, `resolved ttl_s is the shortest RR TTL` |
 | plan §5 | `stopBrowse` stops the schedule and the `found` / `lost` stream; cached records stay | done | `stopBrowse stops queries and found/lost but keeps the cache` |
 | plan §7 M3 | Browse end to end over the fake LAN against a scripted responder: resolve from a PTR answer with additionals, responder-side known-answer suppression on the next query, requery marks refresh without a re-emit, a non-5353 or unicast reply is dropped and counted, a goodbye yields `lost` after 1 s, reversed answer-only records resolve, two queriers on one segment both resolve | done | `a scripted responder on the LAN resolves a browse and is suppressed by the known-answer list`, `requery marks over the LAN refresh the records without re-emitting resolved`, `a responder answering from an ephemeral port is ignored over the LAN`, `a responder replying by unicast is discarded outside the QU window over the LAN`, `a goodbye over the LAN emits lost one second later`, `reversed answer-only records from a responder still resolve over the LAN`, `two queriers on one segment both resolve and see each other's queries as foreign` |
-| plan §4.2 | `handle` never allocates and never fails after `init` (FailingAllocator sweep) | done | `handle never fails after init under a FailingAllocator sweep`, `engine handle never fails after init under a failing allocator` |
+| plan §7 M4 | Advertise end to end over the fake LAN against a real querier on a second engine: `resolved` (SRV, TXT, both addresses of the interface) within 3 s with nothing answered while probing; `withdraw` sends the goodbye and the browser emits `lost` after the 1 s grace; an idle advertised service sends exactly 3 probes + 2 announcements per joined pair and nothing after, own echoes flowing | done | `advertise then browse on a second engine resolves within 3 simulated seconds`, `withdraw sends goodbye and the browser emits lost within 1s`, `idle advertised service sends nothing after announcing` |
+| plan §4.2 | `handle` never allocates and never fails after `init` (FailingAllocator sweep), browsing and advertising alike | done | `handle never fails after init under a FailingAllocator sweep`, `engine handle never fails after init under a failing allocator`, `handle never fails after init under a FailingAllocator sweep with a registration` |
 | plan §4.8 | Queries go out only on joined (ifindex, family) pairs; `setJoined` corrects the default (Revision 5 item 1); `Service.syncJoined` carries a failed join into the Engine | done | `engine joined pairs default to families with an address and follow setJoined`, `syncJoined carries a failed join into the Engine` |
 | plan §4.8 | A `resolved` value lists at most 8 addresses per family | done | `resolved lists at most 8 addresses per family` |
 | plan §4.5 | Eviction pins: only the records the resolve join consumes (browsed PTRs, one SRV and TXT per instance, 8 + 8 addresses per host) are protected; the pin is a bit on the entry, so eviction is one pass over the pool; with every entry pinned the soonest-expiring pinned record goes and the querier is told (`evictions_pinned`, a PTR eviction is a `lost`); cache and instance buckets are keyed by a secret seed | done | `eviction skips pinned records`, `junk SRV records for a found instance do not pin the pool`, `a full pool of descending TTLs is evicted without walking the instance table`, `a pool full of browse data evicts the soonest-expiring pinned record and reports it`, `bucket index depends on the secret seed` |
@@ -182,4 +194,4 @@ scope (a user-interface rule, or behaviour delegated to the OS).
 | plan §7 M1 | Every fixture decodes: all captured datagrams parse, every question and record walks, every rdata of a known type decodes | done | `every fixture parses`, `fixtures load and hex length matches sidecar len` |
 | plan §7 M1 | Re-encode is decode-equal: each fixture rebuilt through the Builder parses back to the same header, questions and records (rdata compared after decompression) | done | `fixture re-encode is decode-equal` |
 | plan §8 tier 3 | Fuzz targets over the codec (Smith API): no panic on random bytes, iterators walk exactly the header counts, names round-trip through text, canonical rdata exists for every parsed record, Builder output re-parses to the same records; seeds replay as intended | done | `fuzz Message.parse never panics`, `fuzz Name.decode never panics`, `fuzz Txt.iterate never panics`, `fuzz Builder round trip`, `fuzz corpus seeds replay through Smith as intended` |
-| plan §8 tier 3 | Fuzz target over `Engine.handle`: random bytes and `RxMeta` with monotonic clock steps; no panic, cache under its cap, `nextDeadline >= now` after a tick | done | `fuzz Engine.handle never panics` |
+| plan §8 tier 3 | Fuzz targets over `Engine.handle`: random bytes and `RxMeta` with monotonic clock steps into an Engine that browses and advertises; no panic, cache under its cap, `nextDeadline >= now` after a tick, every emitted datagram parses with the §18 header rules and comes back as an echo | done | `fuzz Engine.handle never panics`, `fuzz Engine.handle with a registration never panics` |

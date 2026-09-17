@@ -35,13 +35,17 @@
 //!   allow-list zero joined interfaces is `warning.no_interfaces`, not an
 //!   error. Send failures are counted in `stats.tx_dropped`.
 //!
-//! Scope after M3: `browse`, `stopBrowse` and `lookup` drive the real
-//! querier; `advertise` and `updateTxt` forward to the Engine and return
-//! `error.NotImplemented` until M4; `deinit` leaves the groups and closes
-//! the sockets (the bounded goodbye flush is M4). The joined (ifindex,
-//! family) pairs are handed to the Engine with `Engine.setJoined` after
-//! every snapshot, so queries go out only where the join succeeded
-//! (Revision 5 item 1). Everything else is the final shape.
+//! Scope after M4: `browse`, `stopBrowse` and `lookup` drive the real
+//! querier; `advertise`, `withdraw` and `updateTxt` drive the real
+//! responder (`advertise` and `updateTxt` are validated and applied at
+//! the call, stamped like `browse`; `withdraw` is queued); `deinit`
+//! withdraws every registration and runs a bounded goodbye flush (two
+//! send rounds) before it leaves the groups and closes the sockets. The
+//! joined (ifindex, family) pairs are handed to the Engine with
+//! `Engine.setJoined` after every snapshot, so packets go out only where
+//! the join succeeded (Revision 5 item 1). `firstBinder()` reaches the
+//! Engine as `Options.first_binder` / `qu_allowed` (plan section 4.8
+//! "Port sharing"). Everything else is the final shape.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -334,6 +338,9 @@ pub const Service = struct {
         LimitReached,
         OutOfMemory,
         Unexpected,
+        /// `Options.host_label` is not one label of 1..63 octets of UTF-8
+        /// without control characters or dots.
+        InvalidHostLabel,
     };
     pub const AdvertiseError = Engine.AdvertiseError;
     pub const UpdateTxtError = Engine.UpdateTxtError;
@@ -475,6 +482,8 @@ pub const Service = struct {
     /// interfaces (allow-list applied), join both groups on each, hand the
     /// table to the Engine and allocate the batch buffers once.
     pub fn init(gpa: std.mem.Allocator, io: Io, opts: Options) InitError!Service {
+        // Fail on a bad host label before touching a socket.
+        try engine_mod.validateHostLabel(opts.host_label);
         // ---- sockets -------------------------------------------------
         const b4 = try so.bindMdnsSocket(.v4, .{});
         errdefer b4.socket.close(io);
@@ -504,6 +513,7 @@ pub const Service = struct {
             .random = prng.random(),
             .limits = opts.limits,
             .qu_allowed = b4.first_binder,
+            .first_binder = b4.first_binder,
             .max_addrs_per_iface = opts.max_addrs_per_iface,
         });
         errdefer engine.deinit();
@@ -586,9 +596,12 @@ pub const Service = struct {
         return s;
     }
 
-    /// Leave every group and close the sockets. The bounded goodbye flush
-    /// is M4.
+    /// Withdraw every registration and flush the goodbyes (RFC 6762
+    /// section 10.1) in at most `goodbye_flush_rounds` send rounds, then
+    /// leave every group and close the sockets. The flush is bounded and
+    /// best-effort: a send failure is a counted drop, never a stall.
     pub fn deinit(s: *Service) void {
+        s.goodbyeFlush();
         s.leaveAll();
         net.Socket.closeMany(s.io, s.socks[0..s.socks_len]);
         s.gpa.free(s.svc_events.buf);
@@ -600,6 +613,28 @@ pub const Service = struct {
         s.engine.deinit();
         s.gpa.destroy(s.prng);
         s.* = undefined;
+    }
+
+    /// Send rounds `deinit` spends on goodbyes.
+    pub const goodbye_flush_rounds = 2;
+
+    /// `Engine.withdrawAll` at the current clock, then up to
+    /// `goodbye_flush_rounds` of `pollDatagram` / send. Applies queued
+    /// mutations first so a queued `withdraw` is not lost. Cancelation
+    /// during the flush ends it early.
+    fn goodbyeFlush(s: *Service) void {
+        const now_us = @max(s.last_now_us, s.nowUs());
+        s.applyPending(now_us);
+        if (s.engine.registrationCount() == 0) return;
+        s.engine.withdrawAll(now_us);
+        var round: usize = 0;
+        while (round < goodbye_flush_rounds) : (round += 1) {
+            s.engine.tick(now_us);
+            s.flushTx(now_us) catch return;
+            if (s.engine.nextDeadline(now_us)) |d| {
+                if (d > now_us) return;
+            } else return;
+        }
     }
 
     fn ifaceOptions(s: *const Service) ifaces.Options {
@@ -812,30 +847,43 @@ pub const Service = struct {
         return n;
     }
 
-    // ---- mutations (queued) ---------------------------------------------
+    // ---- mutations -----------------------------------------------------
     //
     // Plan 4.2: "The Service queues them and applies them at the start of
-    // the next tick". `withdraw` and `stopBrowse` already go through
-    // `PendingMutation`; `advertise`, `updateTxt` and `browse` call the
-    // Engine directly with `last_now_us`. M4/M5 must add `advertise`,
-    // `update_txt` and `browse` variants to `PendingMutation` (with the
-    // `ServiceDesc` / TXT data copied into the variant, since the caller's
-    // slices do not outlive the call) so the queued-at-next-tick contract
-    // holds for every mutation.
+    // the next tick". `withdraw` and `stopBrowse` go through
+    // `PendingMutation`. `advertise`, `updateTxt` and `browse` validate
+    // their input at the call (the caller wants the typed error at once)
+    // and stamp the Engine with `mutationClock()`: the last tick's clock
+    // in mode A, else `nowUs()`. The Engine only schedules from that
+    // stamp (a probe 0-250 ms later, a browse 20-120 ms later); nothing
+    // goes out before the next `tick` / `step`, which is the observable
+    // half of the contract. M5 may still move the data copy into
+    // `PendingMutation` for the queued half.
 
-    /// M4 fills it: always `error.NotImplemented`.
+    /// Register one service instance. Validated now; probing starts at
+    /// the next `tick` / `step` (RFC 6762 section 8.1). `registered`
+    /// arrives through `poll` about 1.75-2 s later.
     pub fn advertise(s: *Service, desc: ServiceDesc) AdvertiseError!RegId {
-        return s.engine.advertise(desc, s.last_now_us);
+        return s.engine.advertise(desc, s.mutationClock());
     }
 
-    /// Queued; applied at the start of the next `tick` / `step`.
+    /// Queued; applied at the start of the next `tick` / `step` (goodbye
+    /// with TTL 0, RFC 6762 section 10.1).
     pub fn withdraw(s: *Service, id: RegId) void {
         s.queueMutation(.{ .withdraw = id });
     }
 
-    /// M4 fills it: always `error.NotImplemented`.
+    /// Replace the TXT (RFC 6762 section 8.4: two announcements, no
+    /// probe). Validated now; announced at the next `tick` / `step`.
     pub fn updateTxt(s: *Service, id: RegId, txt: []const TxtPair) UpdateTxtError!void {
-        return s.engine.updateTxt(id, txt, s.last_now_us);
+        return s.engine.updateTxt(id, txt, s.mutationClock());
+    }
+
+    /// The clock a mutation is stamped with: the last tick's `now_us` in
+    /// mode A (the embedder's clock is authoritative), else `nowUs()`
+    /// (never below `last_now_us`). `last_now_us` itself is untouched.
+    fn mutationClock(s: *const Service) u64 {
+        return if (s.mode == .tick) s.last_now_us else @max(s.last_now_us, s.nowUs());
     }
 
     /// Start a browse; the first query goes out 20-120 ms later, at the
@@ -847,8 +895,7 @@ pub const Service = struct {
     /// `examples/browse.zig`). `last_now_us` itself is untouched: a mode
     /// A embedder whose clock starts near zero is not pushed forward.
     pub fn browse(s: *Service, service_type: []const u8) BrowseError!BrowseId {
-        const at = if (s.mode == .tick) s.last_now_us else @max(s.last_now_us, s.nowUs());
-        return s.engine.browse(service_type, at);
+        return s.engine.browse(service_type, s.mutationClock());
     }
 
     /// Queued; applied at the start of the next `tick` / `step`.

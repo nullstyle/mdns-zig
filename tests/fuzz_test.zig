@@ -767,12 +767,18 @@ fn fuzzBuilderRoundTrip(_: void, smith: *Smith) anyerror!void {
 // Engine.handle
 // ---------------------------------------------------------------------------
 
-// Engine target (plan section 8 tier 3, M3): random datagrams with a
-// random `RxMeta` and monotonic clock steps into a browsing Engine.
+// Engine target (plan section 8 tier 3, M3, extended in M4): random
+// datagrams with a random `RxMeta` and monotonic clock steps into an
+// Engine that browses one type and advertises one instance, so the
+// querier and the responder (answers, known-answer lists, probes,
+// tie-breaks, conflicts, legacy and QU replies) both see every input.
 // Invariants: no panic, no leak (`std.testing.allocator`), the cache
 // never exceeds its cap, `nextDeadline` after a tick is never in the
-// past, `handle` never allocates (the FailingAllocator sweep in
-// `tests/querier_test.zig` proves that part).
+// past, every emitted datagram parses with the RFC 6762 section 18
+// header rules (multicast ID 0, QR/AA on responses), our own packets
+// come back as echoes, and `handle` never allocates (the FailingAllocator
+// sweeps in `tests/querier_test.zig` and `tests/responder_test.zig`
+// prove that part).
 test "fuzz Engine.handle never panics" {
     try std.testing.fuzz({}, fuzzEngineHandle, .{
         .corpus = message_corpus,
@@ -784,7 +790,7 @@ fn fuzzEngineHandle(_: void, smith: *Smith) anyerror!void {
     var e = try mdns.Engine.init(std.testing.allocator, .{
         .host_label = "fuzz",
         .random = prng.random(),
-        .limits = .{ .max_cache_records = 16, .max_events = 8, .max_interfaces = 2, .max_browses = 2 },
+        .limits = .{ .max_cache_records = 16, .max_events = 8, .max_interfaces = 2, .max_browses = 2, .max_registrations = 2, .max_pending_answers = 8 },
     });
     defer e.deinit();
     var iface: mdns.Interface = .{ .index = 3 };
@@ -796,6 +802,9 @@ fn fuzzEngineHandle(_: void, smith: *Smith) anyerror!void {
     try iface.v6.append(.{ .addr = ll, .prefix_len = 64 });
     try e.setInterfaces(&.{iface}, 0);
     _ = try e.browse("_qmsg._udp", 0);
+    // One registration before any input (M4): the fuzzed bytes hit the
+    // responder's query, known-answer, probe and conflict paths too.
+    _ = try e.advertise(.{ .service_type = "_qmsg._udp", .instance = "fuzz", .port = 4433, .txt = &.{.{ .key = "k", .value = "v" }} }, 0);
 
     var now: u64 = 0;
     var buf: [parse_buf_len]u8 = undefined;
@@ -821,8 +830,16 @@ fn fuzzEngineHandle(_: void, smith: *Smith) anyerror!void {
         while (e.pollDatagram(&out, now)) |d| {
             try std.testing.expect(d.len <= out.len);
             const msg = try Message.parse(out[0..d.len]);
-            try std.testing.expect(!msg.isResponse());
-            // Our own query comes back as an echo and is dropped.
+            const multicast = switch (d.to) {
+                .ip4 => |a| std.mem.eql(u8, &a.bytes, &mdns.core.engine.group_v4),
+                .ip6 => |a| std.mem.eql(u8, &a.bytes, &mdns.core.engine.group_v6),
+            };
+            // Section 18.1: multicast queries and responses carry ID 0; a
+            // legacy reply (unicast) echoes the query's. Section 18.4: AA
+            // on every response.
+            if (multicast) try std.testing.expectEqual(@as(u16, 0), msg.header.id);
+            if (msg.isResponse()) try std.testing.expect(msg.header.flags.aa);
+            // Our own packet comes back as an echo and is dropped.
             const before = e.stats().rx_echo;
             e.handle(out[0..d.len], .{ .from = .{ .ip4 = .{ .bytes = .{ 10, 0, 3, 1 }, .port = 5353 } }, .ifindex = 3, .dst_multicast = true }, now);
             try std.testing.expectEqual(before + 1, e.stats().rx_echo);
@@ -830,6 +847,73 @@ fn fuzzEngineHandle(_: void, smith: *Smith) anyerror!void {
         while (e.pollEvent()) |_| {}
     }
     try std.testing.expectEqual(@as(u64, 0), e.stats().tx_dropped);
+}
+
+// Responder target (plan section 8 tier 3, M4): the same random bytes
+// and `RxMeta` into an Engine that advertises one instance, so every
+// query, probe, known-answer and conflict path of `core/responder.zig`
+// sees adversarial input. Invariants: no panic, no leak, every emitted
+// datagram parses, `nextDeadline >= now` after a tick, and our own
+// packets come back as echoes.
+test "fuzz Engine.handle with a registration never panics" {
+    try std.testing.fuzz({}, fuzzResponderHandle, .{
+        .corpus = message_corpus,
+    });
+}
+
+fn fuzzResponderHandle(_: void, smith: *Smith) anyerror!void {
+    var prng = std.Random.DefaultPrng.init(smith.valueRangeAtMost(u64, 0, std.math.maxInt(u64)));
+    var e = try mdns.Engine.init(std.testing.allocator, .{
+        .host_label = "fuzz",
+        .random = prng.random(),
+        .limits = .{ .max_cache_records = 16, .max_events = 8, .max_interfaces = 2, .max_browses = 2, .max_registrations = 4, .max_pending_answers = 8 },
+        .first_binder = smith.valueRangeAtMost(u8, 0, 1) == 1,
+    });
+    defer e.deinit();
+    var iface: mdns.Interface = .{ .index = 3 };
+    try iface.v4.append(.{ .addr = .{ 10, 0, 3, 1 }, .prefix_len = 24 });
+    var ll: [16]u8 = @splat(0);
+    ll[0] = 0xfe;
+    ll[1] = 0x80;
+    ll[15] = 1;
+    try iface.v6.append(.{ .addr = ll, .prefix_len = 64 });
+    try e.setInterfaces(&.{iface}, 0);
+    const id = try e.advertise(.{ .service_type = "_qmsg._udp", .instance = "fuzz", .port = 4433, .txt = &.{.{ .key = "k", .value = "v" }} }, 0);
+
+    var now: u64 = 0;
+    var buf: [parse_buf_len]u8 = undefined;
+    var out: [wire.max_message_len]u8 = undefined;
+    var rounds: usize = 0;
+    while (rounds < 8) : (rounds += 1) {
+        const len = smith.slice(&buf);
+        const meta: mdns.Engine.RxMeta = .{
+            .from = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+                0 => .{ .ip4 = .{ .bytes = .{ 10, 0, 3, smith.valueRangeAtMost(u8, 0, 255) }, .port = 5353 } },
+                1 => .{ .ip4 = .{ .bytes = .{ 10, 0, 3, 1 }, .port = 5353 } }, // our own address
+                2 => .{ .ip4 = .{ .bytes = .{ 10, 0, 3, 9 }, .port = smith.valueRangeAtMost(u16, 1, 65535) } }, // legacy port
+                else => .{ .ip6 = .{ .bytes = ll, .port = 5353, .interface = .{ .index = 3 } } },
+            },
+            .ifindex = smith.valueRangeAtMost(u32, 0, 4),
+            .dst_multicast = smith.valueRangeAtMost(u8, 0, 1) == 1,
+        };
+        e.handle(buf[0..len], meta, now);
+        if (smith.valueRangeAtMost(u8, 0, 7) == 0) {
+            e.updateTxt(id, &.{.{ .key = "seq", .value = if (rounds % 2 == 0) "1" else "2" }}, now) catch {};
+        }
+        now += smith.valueRangeAtMost(u64, 0, 2 * std.time.us_per_s);
+        e.tick(now);
+        if (e.nextDeadline(now)) |d| try std.testing.expect(d >= now);
+        while (e.pollDatagram(&out, now)) |d| {
+            try std.testing.expect(d.len <= out.len);
+            _ = try Message.parse(out[0..d.len]);
+            const before = e.stats().rx_echo;
+            e.handle(out[0..d.len], .{ .from = .{ .ip4 = .{ .bytes = .{ 10, 0, 3, 1 }, .port = 5353 } }, .ifindex = 3, .dst_multicast = true }, now);
+            try std.testing.expectEqual(before + 1, e.stats().rx_echo);
+        }
+        while (e.pollEvent()) |_| {}
+    }
+    e.withdraw(id, now);
+    while (e.pollDatagram(&out, now)) |_| {}
 }
 
 test "fuzz corpus seeds replay through Smith as intended" {

@@ -72,6 +72,10 @@ pub const probe_interval_us: u64 = ms(250);
 /// three).
 pub const probe_count: u32 = 3;
 
+/// Wait after losing a simultaneous-probe tie-break before probing again
+/// (RFC 6762 section 8.2: "waits one second").
+pub const probe_tiebreak_wait_us: u64 = s(1);
+
 /// Spacing between announcements (RFC 6762 section 8.3: at least 1 s).
 pub const announce_interval_us: u64 = s(1);
 
@@ -149,6 +153,14 @@ pub const answer_delay_tc_max_us: u64 = ms(500);
 /// than once per second"). Probe defence is exempt (section 6, last
 /// paragraph on defending).
 pub const record_rate_limit_us: u64 = s(1);
+
+/// Minimum spacing between multicasts of the same record on the same
+/// interface when defending a probe (RFC 6762 section 6, last paragraph
+/// on defending: exempt from the one-second rule, but "only required to
+/// delay its transmission as necessary to ensure an interval of at least
+/// 250 ms since the last time the record was multicast on that
+/// interface"). Bounds the amplification a probe flood can extract.
+pub const defence_rate_limit_us: u64 = ms(250);
 
 /// Window after a QU query in which a unicast response is ours
 /// (RFC 6762 sections 5.4 and 6; plan section 4.8 port-sharing rule:
@@ -699,6 +711,7 @@ test "constant table matches plan section 4.4" {
     try testing.expectEqual(ms(250), probe_first_delay_max_us);
     try testing.expectEqual(ms(250), probe_interval_us);
     try testing.expectEqual(@as(u32, 3), probe_count);
+    try testing.expectEqual(s(1), probe_tiebreak_wait_us);
     try testing.expectEqual(s(1), announce_interval_us);
     try testing.expectEqual(@as(u32, 2), announce_count);
     try testing.expectEqual(s(1), record_rate_limit_us);

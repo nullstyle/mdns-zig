@@ -5,3 +5,4 @@ zig-pkg/
 mise.local.toml
 .mise.local.toml
 .DS_Store
+__pycache__/

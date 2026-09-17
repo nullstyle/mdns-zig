@@ -11,6 +11,9 @@ fork_zig := env_var_or_default("MDNS_FORK_ZIG", env_var_or_default("HOME", "~") 
 # Lima VM that runs the cross-built Linux binaries. It mounts /Users/nullstyle,
 # so absolute paths from this checkout resolve unchanged inside the VM.
 lima_vm := env_var_or_default("MDNS_LIMA_VM", "zig-uring")
+# `limactl shell` hangs without a tty; the interop recipes use ssh with the
+# VM's generated config instead.
+lima_ssh := "ssh -o IdentityAgent=none -o IdentitiesOnly=yes -F " + env_var_or_default("HOME", "~") + "/.lima/" + lima_vm + "/ssh.config lima-" + lima_vm
 linux_target := env_var_or_default("MDNS_LINUX_TARGET", "aarch64-linux-musl")
 
 default:
@@ -64,9 +67,61 @@ live:
 example-browse *args:
     {{zig}} build example-browse -- {{args}}
 
-# Build and install every example under zig-out/bin without running them.
+# Build and install every example (mdns-browse, mdns-advertise, mdns-peer) under zig-out/bin without running them.
 examples:
     {{zig}} build examples
+
+# `dns-sd -B _qmsg._udp` then lists it; `kill -USR1 $(pgrep -f mdns-advertise)`
+# bumps seq=<n> in the TXT; Ctrl-C sends the goodbye.
+# Advertise one instance with zig-out/bin/mdns-advertise, e.g. `just example-advertise --name demo --port 4433 --txt k=v`.
+example-advertise *args:
+    {{zig}} build example-advertise -- {{args}}
+
+# Advertise + browse _mdnszig._udp in one process, e.g. `just example-peer alice`.
+example-peer *args:
+    {{zig}} build example-peer -- {{args}}
+
+# The Linux build overwrites zig-out/bin/mdns-peer, so the native binary is
+# copied to /tmp/mdns-peer-mac first. Then run `/tmp/mdns-peer-mac alice`
+# here and the printed ssh command in the VM; each prints the other within
+# a few seconds and `gone` after the other is interrupted.
+# Build the two-peer demo for this Mac and for the Lima VM, then print the two commands to run.
+peer-demo:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{zig}} build examples
+    cp zig-out/bin/mdns-peer /tmp/mdns-peer-mac
+    {{zig}} build examples -Dtarget={{linux_target}}
+    echo "here:   /tmp/mdns-peer-mac alice"
+    echo "in VM:  {{lima_ssh}} '$PWD/zig-out/bin/mdns-peer bob'"
+
+# Six dns-sd checks (browse, lookup, goodbye, conflict both ways, updateTxt);
+# run from Terminal or SSH. SKIP_BUILD=1 skips the examples build.
+# macOS interop: interop/macos-dnssd.sh against mDNSResponder.
+interop-macos:
+    sh interop/macos-dnssd.sh
+
+# Cross-builds the examples, then runs interop/lima-avahi.sh inside the VM
+# over ssh (avahi-browse resolves us; avahi-publish clash both ways).
+# Linux interop: interop/lima-avahi.sh against avahi-daemon in the Lima VM.
+interop-lima:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{zig}} build examples -Dtarget={{linux_target}}
+    {{lima_ssh}} "sh $PWD/interop/lima-avahi.sh"
+
+# Runs the join_pktinfo spike as the capture (no tcpdump, no sudo), e.g.
+# `just flood-count --seconds 60 --service demo._qmsg._udp --assert idle-advertise`
+# with mdns-advertise running beside it.
+# Count the packets this host sends for one name per capture window (interop/flood-count.sh).
+flood-count *args:
+    sh interop/flood-count.sh {{args}}
+
+# One legacy unicast query from an ephemeral port; checks the RFC 6762 6.7
+# reply shape, e.g. `just legacy-query demo._qmsg._udp.local SRV`.
+# Legacy unicast query check (interop/legacy_query.py <name> <TYPE>).
+legacy-query name type="SRV" *args:
+    python3 interop/legacy_query.py {{name}} {{type}} {{args}}
 
 # avahi-daemon answers inside the VM; `avahi-publish -s demo2 _qmsg._udp 5001`
 # there makes a found/resolved pair appear. Extra args go to mdns-browse.

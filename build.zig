@@ -63,7 +63,12 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "repo_root", repoRoot(b));
 
-    const unit_tests = b.addTest(.{ .root_module = mdns, .use_llvm = use_llvm });
+    // `-Dtest-filter=<substring>` (repeatable) narrows both test binaries
+    // to matching test names; with `--fuzz` it picks which fuzz target
+    // the runner exercises (the runner fuzzes the first target it finds).
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose name contains this string (repeatable; selects the --fuzz target)") orelse &.{};
+
+    const unit_tests = b.addTest(.{ .root_module = mdns, .use_llvm = use_llvm, .filters = test_filters });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const tests_mod = b.createModule(.{
@@ -74,7 +79,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "mdns", .module = mdns }},
     });
     tests_mod.addOptions("build_options", build_options);
-    const api_tests = b.addTest(.{ .root_module = tests_mod, .use_llvm = use_llvm });
+    const api_tests = b.addTest(.{ .root_module = tests_mod, .use_llvm = use_llvm, .filters = test_filters });
     const run_api_tests = b.addRunArtifact(api_tests);
 
     const test_step = b.step("test", "Run unit and public-API tests");
@@ -148,6 +153,8 @@ pub fn build(b: *std.Build) void {
     const examples_step = b.step("examples", "Build and install every example under zig-out/bin");
     const examples = [_]struct { name: []const u8, file: []const u8, desc: []const u8 }{
         .{ .name = "browse", .file = "examples/browse.zig", .desc = "Browse a service type continuously (mdns-browse [<type>] ...)" },
+        .{ .name = "advertise", .file = "examples/advertise.zig", .desc = "Register one service instance (mdns-advertise --type --name --port --txt k=v ...; SIGUSR1 bumps seq=<n>)" },
+        .{ .name = "peer", .file = "examples/peer.zig", .desc = "Advertise and browse _mdnszig._udp in one process (mdns-peer <name>)" },
     };
     for (examples) |ex| {
         const exe = b.addExecutable(.{

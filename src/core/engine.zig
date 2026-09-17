@@ -13,9 +13,10 @@
 //! 4.6 and 4.8 (malformed, ignored opcode / rcode, source port, section
 //! 11 on-link, the 2 s QU window for unicast responses), the event ring
 //! and the counters. The querier (`core/querier.zig`) owns browses, the
-//! cache and the resolve join. The responder (M4) plugs into
-//! `handleQuery` and `onBridgedEcho`; until then `advertise`,
-//! `updateTxt` return `error.NotImplemented` and `withdraw` is a no-op.
+//! cache and the resolve join. The responder (`core/responder.zig`, M4)
+//! owns registrations, the host record set, probing, announcing,
+//! answering, conflicts and goodbyes; `advertise`, `withdraw` and
+//! `updateTxt` forward to it.
 //!
 //! Ingress order in `handle`:
 //! 1. own echo: the datagram digest is in the echo ring (2 s window) AND
@@ -38,8 +39,10 @@
 //!    the on-link check still runs but the QU-window drop does not: on
 //!    such a socket every multicast response would otherwise be dropped
 //!    and browsing would silently die.
-//! 6. responses -> `Querier.handleResponse`; queries -> `handleQuery`
-//!    (M4). A querier's known-answer list is never cached (section 7.1).
+//! 6. responses -> `Querier.handleResponse` and
+//!    `Responder.handleResponse` (conflict detection on our unique names,
+//!    section 9); queries -> `Responder.handleQuery`. A querier's
+//!    known-answer list is never cached (section 7.1).
 const std = @import("std");
 const Io = std.Io;
 const wire = @import("../wire/root.zig");
@@ -47,6 +50,7 @@ const events = @import("events.zig");
 const timers = @import("timers.zig");
 const echo_ring = @import("echo_ring.zig");
 const querier_mod = @import("querier.zig");
+const responder_mod = @import("responder.zig");
 
 pub const Event = events.Event;
 pub const Warning = events.Warning;
@@ -59,6 +63,8 @@ pub const RegId = events.RegId;
 pub const BrowseId = events.BrowseId;
 pub const Family = events.Family;
 pub const Querier = querier_mod.Querier;
+pub const Responder = responder_mod.Responder;
+pub const validateHostLabel = responder_mod.validateHostLabel;
 pub const EchoRing = echo_ring.EchoRing;
 
 /// mDNS port (RFC 6762 section 2): the source-port rule and the
@@ -80,6 +86,10 @@ pub const Engine = struct {
         /// False when the port is shared (`first_binder == false`): our
         /// queries never set QU (plan section 4.8, "Port sharing").
         qu_allowed: bool = true,
+        /// False when another stack shares 5353 (`Service.firstBinder()`):
+        /// probes are defended by multicast plus the unicast copy (plan
+        /// section 4.8, "Port sharing").
+        first_binder: bool = true,
         /// Per family, at most 8. `setInterfaces` drops extra addresses,
         /// counts them and warns once per call.
         max_addrs_per_iface: u8 = events.max_addrs_per_family,
@@ -120,23 +130,13 @@ pub const Engine = struct {
     /// responder re-announces that interface's address RRSet from here.
     pub const BridgedEcho = struct { sent_ifindex: u32, arrival_ifindex: u32, now_us: u64 };
 
-    pub const InitError = error{OutOfMemory};
+    /// `InvalidHostLabel`: `Options.host_label` is not one label of 1..63
+    /// octets of UTF-8 without control characters (Revision 5 item 8).
+    pub const InitError = error{ OutOfMemory, InvalidHostLabel };
     pub const SetInterfacesError = error{LimitReached};
 
-    /// `error.NotImplemented` is the M4 marker on the responder surface.
-    pub const AdvertiseError = error{
-        NotImplemented,
-        LimitReached,
-        TxtTooLarge,
-        InvalidServiceType,
-        InvalidInstance,
-        DuplicateRegistration,
-    };
-    pub const UpdateTxtError = error{
-        NotImplemented,
-        TxtTooLarge,
-        UnknownRegistration,
-    };
+    pub const AdvertiseError = responder_mod.AdvertiseError;
+    pub const UpdateTxtError = responder_mod.UpdateTxtError;
     pub const BrowseError = querier_mod.BrowseError;
 
     /// Pairs the Engine can hand the querier per tick.
@@ -147,6 +147,7 @@ pub const Engine = struct {
     random: std.Random,
     limits: Limits,
     qu_allowed: bool,
+    first_binder: bool,
     max_addrs_per_iface: u8,
 
     /// Interface table (`limits.max_interfaces` slots, allocated once)
@@ -162,8 +163,10 @@ pub const Engine = struct {
     counters: Stats,
 
     querier: Querier,
+    responder: Responder,
     echoes: EchoRing,
-    /// Time of our last QU query (none in M3): the 2 s unicast window.
+    /// Time of our last QU query (a probe with QU): the 2 s unicast
+    /// window.
     last_qu_query_us: ?u64,
     /// Last bridged echo seen (the M4 hook reads and clears it).
     bridged_echo: ?BridgedEcho,
@@ -182,11 +185,12 @@ pub const Engine = struct {
         errdefer gpa.free(ring_buf);
         var querier = try Querier.init(gpa, opts.limits, opts.random);
         errdefer querier.deinit(gpa);
+        try responder_mod.validateHostLabel(opts.host_label);
+        var responder = try Responder.init(gpa, opts.limits, opts.host_label);
+        errdefer responder.deinit(gpa);
 
         var label: events.Bounded(u8, max_host_label_len) = .{};
-        // A longer label is truncated here; M4 validates it and rejects
-        // it with a typed error.
-        label.appendSlice(opts.host_label[0..@min(opts.host_label.len, max_host_label_len)]) catch unreachable;
+        label.appendSlice(opts.host_label) catch unreachable; // validated <= 63
         @memset(joined, .{});
 
         return .{
@@ -195,6 +199,7 @@ pub const Engine = struct {
             .random = opts.random,
             .limits = opts.limits,
             .qu_allowed = opts.qu_allowed,
+            .first_binder = opts.first_binder,
             .max_addrs_per_iface = @min(opts.max_addrs_per_iface, events.max_addrs_per_family),
             .ifaces = ifaces,
             .joined = joined,
@@ -203,6 +208,7 @@ pub const Engine = struct {
             .events_dropped_warned = false,
             .counters = .{},
             .querier = querier,
+            .responder = responder,
             .echoes = .empty,
             .last_qu_query_us = null,
             .bridged_echo = null,
@@ -210,6 +216,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        e.responder.deinit(e.gpa);
         e.querier.deinit(e.gpa);
         e.gpa.free(e.ring.buf);
         e.gpa.free(e.joined);
@@ -224,6 +231,32 @@ pub const Engine = struct {
     fn emitFromQuerier(ctx: *anyopaque, ev: Event) void {
         const e: *Engine = @ptrCast(@alignCast(ctx));
         e.pushEvent(ev);
+    }
+
+    /// The responder's view of the Engine for one call: the interface
+    /// table, the joined pairs (in `pairs`, caller storage), the
+    /// port-sharing flags and the event sink.
+    fn env(e: *Engine, pairs: *[max_pairs]querier_mod.Pair) responder_mod.Env {
+        return .{
+            .ifaces = e.ifaces[0..e.ifaces_len],
+            .pairs = e.joinedPairs(pairs),
+            .random = e.random,
+            .qu_allowed = e.qu_allowed,
+            .first_binder = e.first_binder,
+            .sink = e.sink(),
+        };
+    }
+
+    /// `first_binder` after init (`Service` learns it from the trial
+    /// bind before the Engine exists; this is for embedders that build
+    /// the Engine first).
+    pub fn setFirstBinder(e: *Engine, first_binder: bool) void {
+        e.first_binder = first_binder;
+        e.qu_allowed = first_binder;
+    }
+
+    pub fn firstBinder(e: *const Engine) bool {
+        return e.first_binder;
     }
 
     // ---- interfaces ---------------------------------------------------
@@ -250,6 +283,10 @@ pub const Engine = struct {
         var new_joined: [max_pairs / 2]Joined = @splat(.{});
         var removed: [max_pairs / 2]u32 = undefined;
         var removed_len: usize = 0;
+        // Interfaces that are new or changed their addresses: the
+        // responder announces its records there (M4).
+        var fresh: [max_pairs / 2]u32 = undefined;
+        var fresh_len: usize = 0;
         for (e.ifaces[0..e.ifaces_len]) |*old| {
             var kept = false;
             for (ifs) |*n| if (n.index == old.index) {
@@ -272,7 +309,11 @@ pub const Engine = struct {
 
             if (e.findSlot(c.iface.index)) |s| {
                 const old = &e.ifaces[s];
-                if (!old.sameAddrs(&c.iface)) changed = true;
+                if (!old.sameAddrs(&c.iface)) {
+                    changed = true;
+                    fresh[fresh_len] = c.iface.index;
+                    fresh_len += 1;
+                }
                 new_joined[i] = .{
                     .v4 = (e.joined[s].v4 or old.v4.len == 0) and c.iface.v4.len != 0,
                     .v6 = (e.joined[s].v6 or old.v6.len == 0) and c.iface.v6.len != 0,
@@ -280,6 +321,8 @@ pub const Engine = struct {
             } else {
                 changed = true;
                 added = true;
+                fresh[fresh_len] = c.iface.index;
+                fresh_len += 1;
                 new_joined[i] = .{ .v4 = c.iface.v4.len != 0, .v6 = c.iface.v6.len != 0 };
             }
         }
@@ -290,6 +333,11 @@ pub const Engine = struct {
         if (changed) e.pushEvent(.interfaces_changed);
         for (removed[0..removed_len]) |ifindex| e.querier.dropInterface(ifindex, e.sink());
         if (added) e.querier.restartSchedules(now_us);
+        if (fresh_len != 0) {
+            var pairs: [max_pairs]querier_mod.Pair = undefined;
+            const rx = e.env(&pairs);
+            for (fresh[0..fresh_len]) |ifindex| e.responder.onInterfaceAdded(&rx, ifindex, now_us);
+        }
     }
 
     const Capped = struct { iface: Interface, dropped4: u64, dropped6: u64 };
@@ -391,30 +439,53 @@ pub const Engine = struct {
         };
     }
 
-    // ---- registrations (M4) -------------------------------------------
+    // ---- registrations ------------------------------------------------
 
-    /// M4 fills it: always `error.NotImplemented`.
+    /// Register one DNS-SD instance (RFC 6763 section 4): validates the
+    /// type (RFC 6335), the instance label (1..63 octets of UTF-8) and
+    /// the TXT (at most 400 octets), then starts probing (RFC 6762
+    /// section 8.1; the host's address records are probed with the first
+    /// registration). `registered` fires after the second announcement.
     pub fn advertise(e: *Engine, desc: ServiceDesc, now_us: u64) AdvertiseError!RegId {
-        _ = e;
-        _ = desc;
-        _ = now_us;
-        return error.NotImplemented;
+        var pairs: [max_pairs]querier_mod.Pair = undefined;
+        const rx = e.env(&pairs);
+        return e.responder.advertise(&rx, desc, now_us);
     }
 
-    /// M4 fills it: no-op.
+    /// Schedule a goodbye (TTL 0, RFC 6762 section 10.1) for the
+    /// registration's records, and for the host's when it was the last
+    /// one. Unknown ids are ignored.
     pub fn withdraw(e: *Engine, id: RegId, now_us: u64) void {
-        _ = e;
-        _ = id;
-        _ = now_us;
+        var pairs: [max_pairs]querier_mod.Pair = undefined;
+        const rx = e.env(&pairs);
+        e.responder.withdraw(&rx, id, now_us);
     }
 
-    /// M4 fills it: always `error.NotImplemented`.
+    /// Withdraw every registration (`Service.deinit`'s goodbye flush).
+    pub fn withdrawAll(e: *Engine, now_us: u64) void {
+        var pairs: [max_pairs]querier_mod.Pair = undefined;
+        const rx = e.env(&pairs);
+        e.responder.withdrawAll(&rx, now_us);
+    }
+
+    /// Replace the TXT rdata (RFC 6762 section 8.4: two announcements
+    /// with cache-flush, no probe; identical rdata is a no-op; deferred
+    /// while probing; over 400 B is `error.TxtTooLarge` and keeps the old
+    /// TXT).
     pub fn updateTxt(e: *Engine, id: RegId, txt: []const TxtPair, now_us: u64) UpdateTxtError!void {
-        _ = e;
-        _ = id;
-        _ = txt;
-        _ = now_us;
-        return error.NotImplemented;
+        var pairs: [max_pairs]querier_mod.Pair = undefined;
+        const rx = e.env(&pairs);
+        return e.responder.updateTxt(&rx, id, txt, now_us);
+    }
+
+    /// Live registrations.
+    pub fn registrationCount(e: *const Engine) usize {
+        return e.responder.count();
+    }
+
+    /// Our host name (`<label>.local`, after any rename).
+    pub fn hostName(e: *const Engine) wire.Name {
+        return e.responder.hostName();
     }
 
     // ---- browses ------------------------------------------------------
@@ -455,7 +526,7 @@ pub const Engine = struct {
             if (e.ownerOf(meta.from)) |sent_ifindex| {
                 e.counters.rx_echo += 1;
                 if (meta.ifindex != 0 and meta.ifindex != sent_ifindex) {
-                    e.onBridgedEcho(sent_ifindex, meta.ifindex, now_us);
+                    e.onBridgedEcho(datagram, sent_ifindex, meta.ifindex, now_us);
                 }
                 return;
             }
@@ -489,10 +560,23 @@ pub const Engine = struct {
             }
         }
         // 6. dispatch.
+        var pairs: [max_pairs]querier_mod.Pair = undefined;
+        const rx = e.env(&pairs);
         if (msg.isResponse()) {
             e.querier.handleResponse(&msg, meta.ifindex, now_us, e.sink());
+            e.responder.handleResponse(&rx, &msg, now_us);
         } else {
-            e.handleQuery(&msg, meta, now_us);
+            // A multicast query skipped the section 11 check above; the
+            // responder still needs it for the unicast reply target
+            // (legacy and QU replies never go off-link).
+            const on_link = !meta.dst_multicast or e.onLink(meta.from, meta.ifindex);
+            e.responder.handleQuery(&rx, &msg, .{
+                .from = meta.from,
+                .ifindex = meta.ifindex,
+                .source_port = sourcePort(meta.from),
+                .dst_unicast = meta.dst_known and !meta.dst_multicast,
+                .on_link = on_link,
+            }, now_us);
         }
     }
 
@@ -503,22 +587,28 @@ pub const Engine = struct {
         return now_us -| last <= timers.qu_unicast_window_us;
     }
 
-    /// Queries from other hosts. M4's responder answers here; the
-    /// querier never caches another querier's known-answer list (RFC
-    /// 6762 section 7.1: it is not authoritative).
-    fn handleQuery(e: *Engine, msg: *const wire.Message, meta: RxMeta, now_us: u64) void {
-        _ = e;
-        _ = msg;
-        _ = meta;
-        _ = now_us;
-    }
-
-    /// M4 hook (plan section 4.8 "Bridged echo"): records the event; the
-    /// responder will re-announce `sent_ifindex`'s address RRSet under the
-    /// 1 s rate rule.
-    fn onBridgedEcho(e: *Engine, sent_ifindex: u32, arrival_ifindex: u32, now_us: u64) void {
+    /// Plan section 4.8 "Bridged echo": our own datagram came back on
+    /// `arrival_ifindex` from `sent_ifindex`'s address. When it carried
+    /// cache-flush A/AAAA for our host name it just flushed our
+    /// `arrival_ifindex` addresses out of every cache on that link, so
+    /// the responder re-announces that interface's address RRSet under
+    /// the one-second rule (section 10.2).
+    fn onBridgedEcho(e: *Engine, datagram: []const u8, sent_ifindex: u32, arrival_ifindex: u32, now_us: u64) void {
         e.counters.rx_echo_bridged += 1;
         e.bridged_echo = .{ .sent_ifindex = sent_ifindex, .arrival_ifindex = arrival_ifindex, .now_us = now_us };
+        const msg = wire.Message.parse(datagram) catch return;
+        if (!msg.isResponse()) return;
+        const host = e.responder.hostName();
+        var it = msg.allRecords();
+        while (it.next()) |rec| {
+            if (!rec.cache_flush) continue;
+            if (rec.rtype != .a and rec.rtype != .aaaa) continue;
+            if (!rec.name.eql(&host)) continue;
+            var pairs: [max_pairs]querier_mod.Pair = undefined;
+            const rx = e.env(&pairs);
+            e.responder.reannounceAddresses(&rx, arrival_ifindex, now_us);
+            return;
+        }
     }
 
     /// The last bridged echo, cleared on read (M4 consumes it).
@@ -535,14 +625,16 @@ pub const Engine = struct {
         };
     }
 
-    /// Fire due timers: cache expiry (`lost`, `resolved` re-emits on
-    /// address-set changes), browse queries, follow-ups and requery marks.
-    /// Due questions are queued for every joined (interface, family) pair
-    /// and drained by `pollDatagram`.
+    /// Fire due timers: the responder's probe and announce steps, then
+    /// cache expiry (`lost`, `resolved` re-emits on address-set changes),
+    /// browse queries, follow-ups and requery marks. Due packets are
+    /// queued for every joined (interface, family) pair and drained by
+    /// `pollDatagram`.
     pub fn tick(e: *Engine, now_us: u64) void {
         var pairs: [max_pairs]querier_mod.Pair = undefined;
-        const joined = e.joinedPairs(&pairs);
-        e.querier.tick(now_us, joined, e.sink());
+        const rx = e.env(&pairs);
+        e.responder.tick(&rx, now_us);
+        e.querier.tick(now_us, rx.pairs, e.sink());
     }
 
     /// Drain one outbound datagram into `buf`. Never allocates. Queries
@@ -556,6 +648,27 @@ pub const Engine = struct {
     /// platform never sees a pktinfo naming an interface it does not
     /// have.
     pub fn pollDatagram(e: *Engine, buf: []u8, now_us: u64) ?TxDatagram {
+        // Responder packets first: answers and probe defences are the
+        // time-critical ones.
+        {
+            var pairs: [max_pairs]querier_mod.Pair = undefined;
+            const rx = e.env(&pairs);
+            while (e.responder.pollDatagram(&rx, buf, now_us)) |b| {
+                if (!e.isJoined(b.pair.ifindex, b.pair.family)) {
+                    e.counters.tx_dropped += 1;
+                    e.responder.dropJobsOn(b.pair);
+                    continue;
+                }
+                e.echoes.record(buf[0..b.len], now_us);
+                e.counters.tx += 1;
+                if (b.qu) e.last_qu_query_us = now_us;
+                return .{
+                    .len = b.len,
+                    .to = b.to orelse e.groupOf(b.pair),
+                    .ifindex = b.pair.ifindex,
+                };
+            }
+        }
         const built = while (e.querier.buildNext(buf, now_us)) |b| {
             if (e.isJoined(b.pair.ifindex, b.pair.family)) break b;
             e.counters.tx_dropped += 1;
@@ -564,11 +677,18 @@ pub const Engine = struct {
         e.counters.tx += 1;
         return .{
             .len = built.len,
-            .to = switch (built.pair.family) {
-                .v4 => .{ .ip4 = .{ .bytes = group_v4, .port = mdns_port } },
-                .v6 => .{ .ip6 = .{ .bytes = group_v6, .port = mdns_port, .interface = .{ .index = built.pair.ifindex } } },
-            },
+            .to = e.groupOf(built.pair),
             .ifindex = built.pair.ifindex,
+        };
+    }
+
+    /// The multicast group of the pair's family, scoped to its
+    /// interface for v6.
+    fn groupOf(e: *const Engine, pair: querier_mod.Pair) Io.net.IpAddress {
+        _ = e;
+        return switch (pair.family) {
+            .v4 => .{ .ip4 = .{ .bytes = group_v4, .port = mdns_port } },
+            .v6 => .{ .ip6 = .{ .bytes = group_v6, .port = mdns_port, .interface = .{ .index = pair.ifindex } } },
         };
     }
 
@@ -577,7 +697,13 @@ pub const Engine = struct {
     /// once.
     pub fn nextDeadline(e: *const Engine, now_us: u64) ?u64 {
         if (e.querier.hasPendingTx()) return now_us;
-        return e.querier.nextDeadline();
+        const q = e.querier.nextDeadline();
+        const r = e.responder.nextDeadline(now_us);
+        if (q) |a| {
+            if (r) |b| return @min(a, b);
+            return a;
+        }
+        return r;
     }
 
     // ---- events -------------------------------------------------------
@@ -611,7 +737,18 @@ pub const Engine = struct {
         st.cache_rejected += cs.rejected_oversize + cs.rejected_full;
         st.instances_dropped += e.querier.stats.instances_dropped;
         st.questions_deferred += e.querier.stats.questions_deferred;
+        const rs = &e.responder.stats;
+        st.conflicts += rs.conflicts;
+        st.answers_dropped += rs.answers_dropped;
+        st.tx_dropped += rs.jobs_dropped;
+        st.dropped_off_link += rs.queries_off_link;
+        st.dropped_bad_port += rs.queries_bad_port;
         return st;
+    }
+
+    /// Responder-side counters.
+    pub fn responderStats(e: *const Engine) responder_mod.RStats {
+        return e.responder.stats;
     }
 
     /// Querier-side counters (instances without a resolve slot, deferred
@@ -718,8 +855,9 @@ test "engine setInterfaces caps addresses and warns once per family" {
     // Over the limit.
     try testing.expectError(error.LimitReached, e.setInterfaces(&.{ testIface(1, 1, 0), testIface(2, 1, 0), testIface(3, 1, 0) }, 2));
 
-    // M4 surface.
-    try testing.expectError(error.NotImplemented, e.advertise(.{ .service_type = "_x._udp", .instance = "a", .port = 1 }, 0));
+    // Responder input validation.
+    try testing.expectError(error.InvalidServiceType, e.advertise(.{ .service_type = "x", .instance = "a", .port = 1 }, 0));
+    try testing.expectError(error.InvalidInstance, e.advertise(.{ .service_type = "_x._udp", .instance = "", .port = 1 }, 0));
 }
 
 test "engine joined pairs default to families with an address and follow setJoined" {

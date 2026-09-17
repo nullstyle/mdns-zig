@@ -2,6 +2,174 @@
 
 ## Unreleased
 
+### M4 - responder: registrations, probing, announcing, answering, conflicts, goodbyes
+
+- `src/core/responder.zig` (new): the sans-IO responder behind
+  `Engine.advertise` / `withdraw` / `updateTxt`. Host A/AAAA per
+  interface (TTL 120) plus per-instance SRV (120) and TXT (4500) as
+  unique RRSets and the shared PTR (4500); probing per RFC 6762 8.1
+  (0-250 ms, three probes 250 ms apart, qtype ANY, proposed records in
+  Authority without cache-flush, QU only when `first_binder`), the host
+  set probed with the first registration; 8.2 tie-break over sorted
+  record sets (one comparison per name per packet; a loser waits 1 s, a
+  second loss renames); 8.3 announcing twice 1 s apart with cache-flush
+  on unique records, `registered` after the second one; section 9
+  conflicts re-probe the same name first and rename (`Name (2)`,
+  `<label>-2`) only after a failed probe, 15 conflicts in 10 s arm a 5 s
+  backoff, a host rename re-announces every SRV (8.4); section 6
+  answering: unique records at once, shared PTRs after 20-120 ms (400-500
+  ms after TC), aggregation per (interface, family) pair, 7.1 known-
+  answer suppression at half TTL, the one-second rate limit keyed by
+  (record, interface, family) with probe defence exempt, 6.1 NSEC for
+  any absent type under a unique name (bitmap per interface), 6.2
+  per-interface addresses, 6.7 legacy unicast replies (ID echoed,
+  question repeated, TTL <= 10, no cache-flush, uncompressed SRV), 5.4
+  QU replies with the TTL/4 rule, RFC 6763 section 12 additionals;
+  probe defence at once, by multicast plus a unicast copy when the
+  prober is on our own host or the port is shared; 10.1 goodbyes on
+  `withdraw` (host records with the last registration); 8.4 `updateTxt`
+  (two TXT-only announcements with cache-flush, no probe; identical
+  rdata is a no-op; deferred while probing; over 400 B is
+  `error.TxtTooLarge` and keeps the old TXT); the bridged-echo hook
+  re-announces the arrival interface's address RRSet under the
+  one-second rule. Pools from `Limits` (registrations capped at 256,
+  pending answers, six jobs per interface, the rate table), no
+  allocation after `init`, deadlines by a scan over the pools.
+- `Engine`: `Options.first_binder` (plus `setFirstBinder` /
+  `firstBinder`), `InitError.InvalidHostLabel` (one UTF-8 label, 1..63
+  octets, no control characters or dots; Revision 5 item 8),
+  `withdrawAll`, `registrationCount`, `hostName`, `responderStats`;
+  queries and responses are routed to the responder (conflict detection
+  on our unique names), responder packets drain before querier packets,
+  a QU probe opens the 2 s unicast window, `nextDeadline` and `stats`
+  (`conflicts`, `answers_dropped`, dropped jobs into `tx_dropped`) fold
+  the responder in; `setInterfaces` announces on new or re-addressed
+  interfaces. `AdvertiseError` / `UpdateTxtError` lose `NotImplemented`
+  and gain `InvalidTxt`.
+- `Service`: passes `first_binder` to the Engine; `advertise` and
+  `updateTxt` are applied at the call (stamped like `browse`); `deinit`
+  withdraws every registration and runs a bounded goodbye flush (two
+  send rounds) before leaving the groups; `InitError.InvalidHostLabel`.
+- `core/timers.zig`: `probe_tiebreak_wait_us` (8.2, 1 s),
+  `defence_rate_limit_us` (6, 250 ms).
+- Review fixes (M4 review): probe defence keeps 250 ms between
+  multicasts of a record per interface (6; deferred, not dropped, so a
+  burst of probes gets one defence per 250 ms) instead of a blanket
+  exemption, and an Authority record counts as a probe only with a
+  question for that name in the packet (8.2); an announcement queued for
+  the host is not sent once the host re-probes after a conflict or said
+  goodbye (8.1, 10.1, 10.2); section 7.2 continuation known answers trim
+  the answer still waiting for that querier; the NSEC for the missing
+  address family rides in the additionals of address answers on
+  one-family interfaces (6.2); a query delivered by direct unicast is
+  answered as QU (5.5) and the QU bit is honoured per question (5.4);
+  legacy replies echo every question (up to 4) in one 512-octet packet
+  with TC on overflow (6.7) and never go to an off-link source (11),
+  nor does a QU unicast reply; a query from source port 0 is dropped;
+  goodbyes aggregate per pair so `withdrawAll` never drops one
+  (`Engine.stats` folds the new `queries_off_link` / `queries_bad_port`
+  into `dropped_off_link` / `dropped_bad_port`); a conflict while
+  probing renames only after the current name was actually probed (9),
+  bounding renames to the probe rate; `catch unreachable` is gone from
+  the rename path. Not done, tracked in `docs/conformance.md`: no
+  per-link re-probe on "Link Change" (8). `build.zig` gains
+  `-Dtest-filter=<substring>` (repeatable) for both test binaries, which
+  also selects the `--fuzz` target. `interop/probe_defence.py` injects
+  a foreign probe from a shared 5353 socket and times the multicast
+  defence (single probe, or a burst that must yield one defence per
+  250 ms).
+- Tests: `tests/responder_test.zig` with the 23 plan M4 named tests
+  (`probe timing` sweeps 10 k seeds: first probe in [0, 250] ms, +250,
+  +250, announcements 250 ms after the third probe and 1 s later) plus
+  withdraw / aggregation / validation coverage, `handle never fails
+  after init under a FailingAllocator sweep with a registration` (every
+  failure index; the allocation count never moves after `init`), and an
+  end-to-end section over `tests/harness/fake_lan.zig` with real engines
+  on both sides (multicast loopback on): `advertise then browse on a
+  second engine resolves within 3 simulated seconds` (nothing answered
+  while probing), `withdraw sends goodbye and the browser emits lost
+  within 1s`, `idle advertised service sends nothing after announcing`
+  (exactly 3 probes + 2 announcements per joined pair over 30 s, then
+  silence), `a query flood is answered at most once per second per
+  pair`, `simultaneous probers of one name converge to distinct names`
+  (four hosts, one name, bounded budget, then silence), `a second stack
+  on our own IP loses to the multicast defence and renames`, `bridged
+  interfaces re-announce the echoed addresses and never rename`. Inline
+  unit tests for the tie-break compare, KA predicate, NSEC bitmap, rate
+  table, rename helpers and validators. `tests/fuzz_test.zig`: `fuzz
+  Engine.handle never panics` now advertises one instance before
+  fuzzing (responder paths under random input; emitted datagrams are
+  checked against the section 18 header rules) beside the dedicated
+  `fuzz Engine.handle with a registration never panics` target;
+  `docs/conformance.md` M4 rows flipped to `done`.
+- Responder fixes found by the LAN tests: the bridged-echo re-announce
+  (RFC 6762 10.2) applies the one-second rule as a drop instead of a
+  deferral (a deferred re-announce landed after the peers' flush grace,
+  flushed the other interface's set and echoed back across the bridge,
+  one packet per second per pair, forever; now a multi-homed host on
+  bridged links settles after at most one bounce); an interface that
+  joins or changes its addresses is announced twice one second apart
+  (8.3 "Link Change"), not once.
+- `tests/live/main.zig`: `--advertise NAME` registers
+  `NAME._mdnszig._udp` on 4433 and prints `registered` / `renamed` /
+  `host_renamed`; `RESULT` gains `conflicts=`. Verified on macOS beside
+  mDNSResponder (`dns-sd -B` Add on every interface ~1.9 s after start,
+  Rmv on exit, `dns-sd -L` resolves host, port and TXT; ours-first
+  conflict makes `dns-sd -R` rename to `demo (2)`) and in Lima beside
+  avahi (`avahi-browse -r` resolves per-interface addresses; avahi-first
+  conflict renames us to `demo (2)`, ours-first makes avahi pick
+  `demo #2`).
+
+### M4 examples and interop (plan section 7 M4 deliverables)
+
+- `examples/advertise.zig` (`zig-out/bin/mdns-advertise`, `zig build
+  example-advertise -- ...`): registers one instance from the command
+  line (`--type`, `--name`, `--port`, `--txt k=v` repeatable, `--host
+  <label>` defaulting to the OS host name sanitized to one
+  letter-digit-hyphen label, `--no-ipv6`, `--ifindex N` repeatable,
+  `--loopback`, `--stats`), mode B `Service.run`, prints `registered` /
+  `renamed` / `host_renamed` / `warning` lines. SIGINT and SIGTERM flip
+  the shutdown atomic so `deinit` sends the goodbye (RFC 6762 10.1);
+  SIGUSR1 counts a TXT bump that the run hook applies through
+  `Service.updateTxt` as `seq=<n>` (8.4: re-announce, no probe). Signal
+  handlers only touch atomics.
+- `examples/peer.zig` (`zig-out/bin/mdns-peer <name>`): the two-peer
+  demo, advertise `_mdnszig._udp` on 4433 with `role=peer` and browse
+  the same type in one process; prints `peer <instance> at <addr>:<port>
+  ifindex <n>` on `resolved` and `peer <instance> gone` on `lost`,
+  skipping its own registration by instance label (tracked across a
+  `renamed`).
+- `build.zig`: `example-advertise` and `example-peer` run steps
+  (forwarded args, install-only on cross builds); `zig build examples`
+  installs all three example binaries.
+- `interop/macos-dnssd.sh`: six `dns-sd` checks with PASS/FAIL lines,
+  deadlines (`perl -e 'alarm N; exec @ARGV'`, no coreutils `timeout` on
+  macOS) and an EXIT cleanup trap: `-B` lists us within 3 s, `-L` shows
+  port and TXT, goodbye shows `Rmv` within 3 s, conflict with `dns-sd -R`
+  first (we rename to `demo (2)`), conflict with ours first (mDNSResponder
+  renames), SIGUSR1 -> `-L` shows `seq=1`.
+- `interop/legacy_query.py`: stdlib-only one-shot query from an ephemeral
+  port to 224.0.0.251:5353; parses the unicast reply and reports ID
+  echoed, TTL <= 10, cache-flush clear and SRV target uncompressed (RFC
+  6762 6.7, 18.14); exit 0 only when all four hold. Calibration: it
+  flags mDNSResponder's `.local` pointer inside the SRV rdata.
+- `interop/lima-avahi.sh`: runs inside the Lima VM (ssh form; `limactl
+  shell` hangs): `avahi-browse -prt` resolves our cross-built advertise;
+  `avahi-publish` first -> we rename; ours first -> `avahi-publish`
+  reports a collision or renames. Checks the binary is a Linux build.
+- `interop/flood-count.sh`: tcpdump-free packet budget. Runs the
+  `join_pktinfo` spike with `--dump` for the window, keeps datagrams
+  whose sidecar source is one of this host's addresses and whose payload
+  contains the wire-encoded name, prints counts by QR bit and second, and
+  asserts `--assert idle-advertise` (0 unsolicited after `--after`,
+  default 30 s; a response is solicited when a foreign query for the
+  name preceded it within 2 s) or `--assert idle-browse` (<= 2 queries
+  after minute one).
+- `interop/README.md` (macOS and Lima instructions, exit codes),
+  justfile recipes `examples`, `example-advertise`, `example-peer`,
+  `peer-demo`, `interop-macos`, `interop-lima`, `flood-count`,
+  `legacy-query` (`lima_ssh` variable for the ssh form).
+
 ### M3 gate fixes - Darwin send window; per-interface cache
 
 - P1, `mdns-live` hang on macOS with the default interface set: the

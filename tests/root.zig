@@ -11,6 +11,7 @@ comptime {
     _ = @import("service_test.zig");
     _ = @import("harness_test.zig");
     _ = @import("querier_test.zig");
+    _ = @import("responder_test.zig");
     _ = @import("dnssd_test.zig");
     _ = @import("harness/scenario.zig");
     _ = @import("harness/fake_lan.zig");

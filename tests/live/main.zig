@@ -7,14 +7,18 @@
 //! runs the Service in mode B (`step`) for `--seconds` and reports what
 //! it saw: every `found`, `resolved` and `lost` event, then the counters.
 //! Run `dns-sd -R demo _qmsg._udp . 4433 k=v` beside it to see a
-//! `found` and a `resolved` line.
+//! `found` and a `resolved` line. With `--advertise NAME` it also
+//! registers `NAME._mdnszig._udp.local` on port 4433 (M4 responder) and
+//! prints `registered` / `renamed` / `host_renamed`; `dns-sd -B
+//! _mdnszig._udp` beside it lists the instance.
 //! Packet counts are informational: on macOS 15+ a GUI-launched process
 //! may be blocked by Local Network privacy and receive nothing while
 //! being entirely correct; the bind, the join list and `firstBinder()`
 //! are the assertions.
 //!
 //! Flags: `--seconds N` (default 4), `--ifindex N` (repeatable; becomes
-//! the allow-list), `--browse TYPE`, `--no-ipv6`, `--no-loopback`.
+//! the allow-list), `--browse TYPE`, `--advertise NAME`, `--no-ipv6`,
+//! `--no-loopback`.
 //!
 //! If a run ever hangs (the M3 gate saw one on macOS with a content
 //! filter attached; see `socket_opts.send_window_needs_nonblock`), take
@@ -40,7 +44,12 @@ const Options = struct {
     include_loopback: bool = true,
     allow: std.ArrayList(u32) = .empty,
     browse: []const u8 = "_qmsg._udp",
+    advertise: ?[]const u8 = null,
 };
+
+/// Service type and port `--advertise` registers.
+const advertise_type = "_mdnszig._udp";
+const advertise_port: u16 = 4433;
 
 fn parseArgs(init: std.process.Init) !Options {
     var opts: Options = .{};
@@ -56,6 +65,8 @@ fn parseArgs(init: std.process.Init) !Options {
             try opts.allow.append(arena, try std.fmt.parseInt(u32, v, 10));
         } else if (std.mem.eql(u8, arg, "--browse")) {
             opts.browse = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--advertise")) {
+            opts.advertise = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--no-ipv6")) {
             opts.ipv6 = false;
         } else if (std.mem.eql(u8, arg, "--no-loopback")) {
@@ -94,7 +105,9 @@ fn drainEvents(svc: *mdns.Service, out: *Io.Writer) !void {
                 }
                 try out.print(" txt_len={d}\n", .{r.txt.slice().len});
             },
-            else => try out.print("event kind={t}\n", .{ev}),
+            .registered => |g| try out.print("event kind=registered id={d} instance={f}\n", .{ @backingInt(g.id), g.instance }),
+            .renamed => |g| try out.print("event kind=renamed id={d} old={f} new={f}\n", .{ @backingInt(g.id), g.old, g.new }),
+            .host_renamed => |h| try out.print("event kind=host_renamed old={f} new={f}\n", .{ h.old, h.new }),
         };
     }
 }
@@ -141,6 +154,19 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     try out.print("browse type={s} id={d}\n", .{ opts.browse, @backingInt(browse_id) });
+    if (opts.advertise) |name| {
+        const reg_id = svc.advertise(.{
+            .service_type = advertise_type,
+            .instance = name,
+            .port = advertise_port,
+            .txt = &.{.{ .key = "txtvers", .value = "1" }},
+        }) catch |err| {
+            try out.print("advertise instance={s} type={s} err={t}\n", .{ name, advertise_type, err });
+            try out.print("RESULT bind=OK advertise=FAILED err={t}\n", .{err});
+            return 1;
+        };
+        try out.print("advertise instance={s} type={s} port={d} id={d}\n", .{ name, advertise_type, advertise_port, @backingInt(reg_id) });
+    }
     try out.flush();
 
     // Mode B for `seconds`, 250 ms cap per step.
@@ -174,13 +200,14 @@ pub fn main(init: std.process.Init) !u8 {
     try out.print("tx timeouts={d} slow={d} max_us={d} window_failed={d} window_opened={d}\n", .{
         tx.timeouts, tx.slow, tx.max_us, tx.window_failed, tx.window_opened,
     });
-    try out.print("RESULT bind=OK first_binder={} joined_v4={d} joined_v6={d} rx_v4_ifindex={d} rx_v6_ifindex={d} tx={d}\n", .{
+    try out.print("RESULT bind=OK first_binder={} joined_v4={d} joined_v6={d} rx_v4_ifindex={d} rx_v6_ifindex={d} tx={d} conflicts={d}\n", .{
         svc.firstBinder(),
         svc.joinedCountFor(.v4),
         svc.joinedCountFor(.v6),
         rx.v4_with_ifindex,
         rx.v6_with_ifindex,
         st.tx,
+        st.conflicts,
     });
     return 0;
 }

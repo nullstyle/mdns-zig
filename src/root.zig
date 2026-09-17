@@ -10,13 +10,14 @@ pub const port: u16 = 5353;
 /// builder (RFC 1035, RFC 6762, RFC 6763).
 pub const wire = @import("wire/root.zig");
 
-/// Sans-IO core: value types, cache, timers, querier and the Engine. Never imports
-/// `platform`.
+/// Sans-IO core: value types, cache, timers, querier, responder and the
+/// Engine. Never imports `platform`.
 pub const core = struct {
     pub const events = @import("core/events.zig");
     pub const cache = @import("core/cache.zig");
     pub const engine = @import("core/engine.zig");
     pub const querier = @import("core/querier.zig");
+    pub const responder = @import("core/responder.zig");
     pub const timers = @import("core/timers.zig");
     pub const echo_ring = @import("core/echo_ring.zig");
 };
@@ -33,7 +34,7 @@ pub const platform = struct {
 pub const service = @import("service.zig");
 pub const Service = service.Service;
 pub const Mailbox = service.Mailbox;
-/// Sans-IO core: querier, cache and ingress rules (M3); responder in M4.
+/// Sans-IO core: querier, cache, responder and the ingress rules.
 pub const Engine = core.engine.Engine;
 
 // ---- public value types (plan section 5) -----------------------------
@@ -64,6 +65,7 @@ test {
     _ = core.cache;
     _ = core.engine;
     _ = core.querier;
+    _ = core.responder;
     _ = core.timers;
     _ = core.echo_ring;
     _ = service;
