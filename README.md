@@ -4,6 +4,18 @@
 
 std-only mDNS (RFC 6762) and DNS-SD (RFC 6763) for Zig.
 
+> **This library was vibe coded.** Claude Code (Opus 5) wrote every line of
+> code, test, script and document in this repository over two days
+> (2026-09-15 to 2026-09-17), working from a plan the author approved and
+> steering a fleet of implementer, reviewer and gate agents. The author
+> set the goals, made the design decisions the agents asked about, and
+> committed each milestone. No human has yet read the code line by line.
+> What has been verified: 315 unit and fake-LAN tests in Debug and
+> ReleaseSafe, fuzzing of every parser and of `Engine.handle`, and live
+> interop against mDNSResponder (`dns-sd`) on macOS and avahi on Linux, all
+> run on the author's machines. Treat it like any other new, unaudited
+> network code: read what you depend on, and report what you find.
+
 mdns-zig advertises and browses services on the local link next to the OS
 daemon (mDNSResponder, avahi, systemd-resolved) without owning a thread.
 A sans-IO `Engine` holds every RFC timer and the record cache. A thin
