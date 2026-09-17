@@ -18,7 +18,13 @@
 //! Mode B (`Service.run`): the loop steps the Service with a 250 ms cap and
 //! a hook drains the events after every step. SIGINT flips the shutdown
 //! atomic the loop watches, so Ctrl-C ends the run within one step cap.
-//! `--once` (a `Service.lookup` one-shot with a quiet period) lands in M5.
+//!
+//! `--once` is the bounded one-shot of plan section 5 flow 4:
+//! `Service.lookup` with a 3 s timeout and a 500 ms quiet period, one
+//! `resolved` line per instance found (per interface: a responder heard
+//! on two links prints twice, with each link's addresses), nothing when
+//! nothing answers, exit 0 either way. The browse is stopped when
+//! `lookup` returns, so no query for the type goes out after exit.
 //!
 //! Flags: `<type>` (positional), `--ifindex N` (repeatable allow-list),
 //! `--no-ipv6`, `--loopback` (include loopback interfaces), `--stats`
@@ -44,7 +50,7 @@ const usage =
     \\  --no-ipv6     v4 only
     \\  --loopback    include loopback interfaces
     \\  --stats       print the Engine counters on exit
-    \\  --once        one-shot lookup (M5: not yet)
+    \\  --once        one-shot lookup: 3 s timeout, 500 ms quiet, one line per resolved
     \\
 ;
 
@@ -100,6 +106,9 @@ fn installSigInt() void {
 
 const Printer = struct {
     out: *Io.Writer,
+    /// `--once`: only warnings, so a lookup that finds nothing prints
+    /// nothing.
+    warnings_only: bool = false,
 
     fn hook(ctx: ?*anyopaque, svc: *mdns.Service, _: u64) anyerror!void {
         const p: *Printer = @ptrCast(@alignCast(ctx.?));
@@ -118,6 +127,7 @@ const Printer = struct {
 
     fn print(p: *Printer, ev: mdns.Event) !void {
         const out = p.out;
+        if (p.warnings_only and ev != .warning and ev != .resolved) return;
         switch (ev) {
             .found => |f| try out.print("found    {f} ifindex={d}\n", .{ f.instance, f.ifindex }),
             .lost => |l| try out.print("lost     {f} ifindex={d}\n", .{ l.instance, l.ifindex }),
@@ -154,6 +164,33 @@ const Printer = struct {
     }
 };
 
+/// `--once`: `Service.lookup` (mode B) with the plan's defaults, then one
+/// `resolved` line per result. Warnings queued by `init` were printed by
+/// the caller; everything `lookup` discards stays discarded.
+fn lookupOnce(svc: *mdns.Service, printer: *Printer, opts: Options) !u8 {
+    const out = printer.out;
+    var found: [lookup_max_results]mdns.Resolved = undefined;
+    const n = svc.lookup(opts.service_type, .{ .timeout_us = 3 * std.time.us_per_s, .quiet_us = 500 * std.time.us_per_ms }, &found) catch |err| {
+        try out.print("lookup {s} failed: {t}\n", .{ opts.service_type, err });
+        return 1;
+    };
+    for (found[0..n]) |r| try printer.print(.{ .resolved = r });
+    if (opts.print_stats) try printStats(svc, out);
+    try out.flush();
+    return 0;
+}
+
+/// Results `--once` can hold (one per instance and interface).
+const lookup_max_results = 32;
+
+fn printStats(svc: *mdns.Service, out: *Io.Writer) !void {
+    const st = svc.stats();
+    try out.print("stats rx={d} rx_echo={d} tx={d} dropped_malformed={d} dropped_bad_port={d} dropped_off_link={d} dropped_unicast_unexpected={d} dropped_ignored={d} evictions={d} events_dropped={d}\n", .{
+        st.rx,               st.rx_echo,                    st.tx,              st.dropped_malformed, st.dropped_bad_port,
+        st.dropped_off_link, st.dropped_unicast_unexpected, st.dropped_ignored, st.evictions,         st.events_dropped,
+    });
+}
+
 pub fn main(init: std.process.Init) !u8 {
     var threaded: Io.Threaded = .init(init.gpa, .{});
     defer threaded.deinit();
@@ -174,10 +211,6 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         },
     };
-    if (opts.once) {
-        try out.print("--once: not yet (Service.lookup lands in M5); browsing {s} continuously instead\n", .{opts.service_type});
-    }
-
     var svc = mdns.Service.init(init.gpa, io, .{
         .host_label = "mdns-browse",
         .ipv6 = opts.ipv6,
@@ -189,8 +222,9 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer svc.deinit();
 
-    var printer: Printer = .{ .out = out };
+    var printer: Printer = .{ .out = out, .warnings_only = opts.once };
     try printer.drain(&svc);
+    if (opts.once) return lookupOnce(&svc, &printer, opts);
     _ = svc.browse(opts.service_type) catch |err| {
         try out.print("browse {s} failed: {t}\n", .{ opts.service_type, err });
         return 1;
@@ -208,13 +242,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     try printer.drain(&svc);
 
-    if (opts.print_stats) {
-        const st = svc.stats();
-        try out.print("stats rx={d} rx_echo={d} tx={d} dropped_malformed={d} dropped_bad_port={d} dropped_off_link={d} dropped_unicast_unexpected={d} dropped_ignored={d} evictions={d} events_dropped={d}\n", .{
-            st.rx,               st.rx_echo,                    st.tx,              st.dropped_malformed, st.dropped_bad_port,
-            st.dropped_off_link, st.dropped_unicast_unexpected, st.dropped_ignored, st.evictions,         st.events_dropped,
-        });
-    }
+    if (opts.print_stats) try printStats(&svc, out);
     try out.print("stopped\n", .{});
     return 0;
 }

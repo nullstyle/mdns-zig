@@ -30,6 +30,11 @@ pub const platform = struct {
     pub const ifaces = @import("platform/ifaces.zig");
 };
 
+/// Typed TXT schemas for the workspace consumers (`_qmsg._udp`,
+/// `_qmesh._udp`, `_shared-studio._udp`): `Advert`, `Parsed`, `SeedSet`.
+/// Imports only `std`, the codec and the value types; never `Service`.
+pub const profiles = @import("profiles/root.zig");
+
 /// The `std.Io` shell: sockets, interface table, loop modes, `Mailbox`.
 pub const service = @import("service.zig");
 pub const Service = service.Service;
@@ -69,6 +74,7 @@ test {
     _ = core.timers;
     _ = core.echo_ring;
     _ = service;
+    _ = profiles;
     _ = platform.socket_opts;
     _ = platform.ifaces;
     _ = wire;

@@ -2,7 +2,271 @@
 
 ## Unreleased
 
-### M4 - responder: registrations, probing, announcing, answering, conflicts, goodbyes
+## 0.1.0 - 2026-09-16
+
+First release. Every item below is in the tarball unless it says
+otherwise; the milestone record after the summary has the details, the
+review fixes and the measurements.
+
+### Wire codec (`mdns.wire`)
+
+- Zero-allocation `Name` (bounded compression decode, RFC 6763 §4.3
+  escaping, ASCII case folding, RFC 6335 §5.1 service-name validator),
+  `Message` parse with zero-copy question and record iterators (QU and
+  cache-flush bits split out, 9000 B cap), rdata codecs for A, AAAA,
+  PTR, SRV, TXT, NSEC (restricted form) and HINFO with the RFC 6762 §8.2
+  canonical comparison, `Txt` / `TxtView` (400 B, case-insensitive
+  first-match keys, boolean vs empty), and a `Builder` with a
+  compression table, 1472 / 1452 targets, 8972 / 8952 hard caps, section
+  ordering and legacy mode. No `unreachable`, `@panic` or unchecked
+  slicing on any byte fed from the network.
+
+### Engine, querier and cache (`mdns.Engine`, `src/core/`)
+
+- Sans-IO `Engine`: `handle` / `tick` / `pollDatagram` / `nextDeadline`
+  / `pollEvent` / `stats` over a caller clock and an injected
+  `std.Random`; every pool preallocated from `Limits`; `handle` never
+  allocates or fails after `init` (FailingAllocator sweep). Ingress
+  rules: own-echo recognition (digest ring AND source address), OPCODE /
+  RCODE, source port 5353, §11 on-link check, the 2 s QU window.
+- Querier: browses on the §5.2 ladder (20-120 ms, then 1 s doubling to
+  60 min, +0-2 %), QM only, one packet per joined (interface, family)
+  pair with the known-answer list (§7.1, TC continuation §7.2), requery
+  marks at 80/85/90/95 % merged into the schedule, follow-up SRV / TXT /
+  A / AAAA questions on the instance's interface, order-independent
+  harvesting, `found` / `lost` only for browsed types, the `resolved`
+  re-emit rule (SRV, TXT or address-set change; never a same-data
+  refresh; `ttl_s` = shortest RR TTL), `stopBrowse` keeps the cache,
+  `error.DuplicateBrowse`.
+- Cache keyed by `(name, type, class, ifindex)`: cache-flush (§10.2, 1 s
+  grace), goodbye (§10.1, 1 s), expiry, eviction by soonest expiry with
+  pins on the records the resolve join consumes, secret-seeded buckets,
+  per-interface `found` / `resolved` / `lost` (one row per interface,
+  as `dns-sd -B`), interface removal drops its scope.
+- `timers.zig`: every RFC 6762 constant with its section, the 24 h query
+  budget (35 + 1) derived at comptime.
+
+### Responder
+
+- Registrations with host A / AAAA per interface (TTL 120), SRV (120),
+  TXT and PTR (4500); probing (§8.1: 0-250 ms, three probes 250 ms
+  apart, qtype ANY, Authority section, QU only when first binder), §8.2
+  tie-break, announcing twice with cache-flush (§8.3), §9 conflicts
+  (re-probe the same name first; rename `Name (2)` / `<label>-2` only
+  after a failed probe; 15 conflicts in 10 s arm a 5 s backoff), host
+  rename re-announces every SRV (§8.4).
+- Answering (§6): unique records at once, shared PTRs after 20-120 ms
+  (400-500 ms after TC), aggregation per pair, known-answer suppression
+  at half TTL, the 1 s rate limit per (record, interface, family) with
+  probe defence at 250 ms, NSEC for any absent type under a unique name
+  (§6.1) and for the missing address family (§6.2), per-interface
+  addresses, RFC 6763 §12 additionals, legacy unicast replies (§6.7: ID
+  echoed, questions repeated, TTL <= 10, no cache-flush, uncompressed
+  SRV, 512 octets with TC), QU replies with the TTL/4 rule per question
+  (§5.4), direct-unicast queries answered as QU (§5.5), no unicast reply
+  to an off-link source (§11), multicast defence for same-host and
+  shared-port probes.
+- `updateTxt` as a §8.4 re-announce (no probe, no-op on identical
+  rdata, deferred while probing, `error.TxtTooLarge` over 400 B keeps
+  the old TXT); goodbyes on `withdraw` and on `deinit` (bounded flush,
+  aggregated per pair); the bridged-echo re-announce (§10.2) under the
+  1 s rule as a drop; two announcements on a new or re-addressed
+  interface (no per-link re-probe, see Known limitations).
+
+### Service and loop modes (`mdns.Service`, `mdns.Mailbox`)
+
+- Two raw-bound sockets on `*:5353` (`SO_REUSEADDR` + `SO_REUSEPORT`,
+  `first_binder` from a trial bind), joins per interface with
+  `warning.join_failed{ifindex, family}` / `v6_unavailable` /
+  `no_interfaces` degrades, an `ifindex` allow-list, `include_loopback`,
+  `refreshInterfaces` on a 30 s cadence, batch buffers allocated once,
+  events by value through `poll`.
+- Mode A `tick(now_us)` with the embedder's clock and the
+  `rx_poll_interval_us` drain rule; mode B `step(cap)` (timed wait on one
+  socket, zero drain of the other, 250 ms cap) and `run(shutdown, hook)`;
+  mode C `serve(&mailbox)` as an `Io.Group` task with the bounded
+  `Mailbox.put` (non-blocking put, 10 ms retries up to the step cap, then
+  drop oldest and count; `warning.events_dropped` once; a closed mailbox
+  ends `serve`). One clock source per Service, asserted.
+- `lookup(type, {timeout_us, quiet_us}, out)`: bounded one-shot browse
+  that stops its browse on every exit path, `error.Canceled` honoured,
+  one slot per `(instance, type, ifindex)`. `advertise` / `updateTxt` /
+  `withdraw` / `browse` / `stopBrowse` validate at the call and are
+  applied at the next tick with that tick's clock (`advertise` and
+  `browse` return their ids at once from a reservation without a
+  timer). `serve` ends with the goodbye flush on both exits. `stats()`
+  sums Engine and Service counters; `rxCounters()` / `txCounters()` for
+  operators.
+- Timed calls only: `recvTimed` / `sendTimed` take a `Timed` with no
+  `.none` member. Blocking fds under `Io.Threaded`; on Darwin an
+  `O_NONBLOCK` send window around each send batch plus `SO_SNDLOWAT =
+  SO_SNDBUF`, so a stalled send is a 2 ms timeout and a counted drop.
+  `warning.no_packets_10s` for the macOS Local Network privacy case.
+
+### Platform (`src/platform/`)
+
+- `socket_opts.zig`: per-OS constant tables for Darwin, Linux, FreeBSD
+  and OpenBSD with comptime cross-checks against std, `setsockoptChecked`
+  with a typed errno map, raw bind, `trialBindWithoutReuse`, group join
+  / leave (`ip_mreq` / `ip_mreqn` / `ipv6_mreq`), TTL and hop limit 255
+  for multicast and unicast, `IP_MULTICAST_ALL` / `IPV6_MULTICAST_ALL`
+  off on Linux, pktinfo / `IP_RECVIF` cmsg codec at 4- and 8-byte
+  alignment, per-send `IP_MULTICAST_IF` where needed (the BSDs' v4
+  path, and on Darwin before every v4 multicast send beside the pktinfo
+  cmsg: with it unset a pktinfo send naming `lo0` succeeds once and then
+  fails `ENETUNREACH` for good), the send-window and low-water helpers.
+- `ifaces.zig`: self-declared `getifaddrs` / `freeifaddrs` and `ifaddrs`
+  layouts per OS, up + multicast filter (Linux `lo` kept for v4 only
+  under `include_loopback`), netmask to prefix length (short Darwin
+  masks handled), v6 global-first order, 8 addresses per family with
+  `v4_dropped` / `v6_dropped`, `diff()`.
+
+### Profiles (`mdns.profiles`)
+
+- `qmsg`, `qmesh` and `studio` TXT schemas (plan §3.4): `Advert` builders
+  and `parse` for `_qmsg._udp`, `_qmesh._udp` and `_shared-studio._udp`
+  (`txtvers=1`, `alpn`, `spki` / `id` as exactly 64 lowercase hex,
+  `epoch` up to 32 hex, `sn`, `pat`, `role`, `clip`), the qmesh
+  `SeedSet` (one admission per `(id, epoch)`), and an import graph of
+  std plus mdns value types only.
+
+### Examples and interop
+
+- `examples/browse.zig` (`mdns-browse [--once] <type>`), `advertise.zig`
+  (`mdns-advertise --type --name --port --txt k=v`; SIGUSR1 bumps
+  `seq=<n>` through `updateTxt`, SIGINT sends the goodbye) and
+  `peer.zig` (`mdns-peer <name>`: advertise + browse in one process).
+- `interop/macos-dnssd.sh` (six `dns-sd` checks incl. conflicts both
+  ways and the TXT update), `lima-avahi.sh` (avahi resolves us; clashes
+  both ways), `flood-count.sh` (packet budgets without tcpdump),
+  `legacy_query.py`, `probe_defence.py`, `interop/README.md`.
+
+### Tests
+
+- `zig build test` in Debug and ReleaseSafe (300+ tests): codec round
+  trips and a malformed corpus, 122 packet fixtures from
+  mDNSResponder with JSON sidecars (decode, byte-identical re-encode,
+  goodbye and probe shapes), every plan M1-M4 named test, the fake-LAN
+  harness (`tests/harness/`: N engines, per-interface fan-out, loopback
+  echo, loss, bridging, a scripted responder) with 10 k seeded timing
+  iterations, FailingAllocator sweeps, real-socket public-API tests,
+  the flood guards (idle advertise sends nothing; 24 h browse budget;
+  100 simultaneous probers converge; bridged echoes never rename), six
+  `std.testing.fuzz` targets over the codec and `Engine.handle`, the
+  conformance guard (`docs/conformance.md` rows marked `done` must name
+  existing tests), and `tests/live/main.zig` (`zig build live`).
+- `tests/consumer`: out-of-tree smoke build against the package.
+
+### Docs, build and CI
+
+- `README.md`, `docs/design.md` (layers, loop modes, clock rule, timed
+  calls and the Darwin send window, cache model, every timer with its
+  RFC section, pool sizes, error policy, protocol rules as implemented,
+  deviations from the plan), `docs/conformance.md` (every RFC clause
+  with a status and a test), `docs/platform-matrix.md` (constants,
+  structs, coexistence, macOS and Linux measurements), `SECURITY.md`.
+- `build.zig`: module `mdns` (links libc), plain `standardOptimizeOption`
+  with a fast/small refusal, early return for dependency builds, steps
+  `test`, `test-exe`, `live`, `examples`, `example-*`, `docs`,
+  `spike-*`, `-Dtest-filter`, `-Duse-llvm`; `build.zig.zon` with
+  consumer-only `.paths` (no `tests/`, `spikes/`, `interop/`).
+- CI: Debug and ReleaseSafe on ubuntu, Debug on macos-15 (hermetic),
+  quality lane (`mise fmt`, `zig fmt` over build.zig, src, tests,
+  spikes and examples, `zig build docs`, `tools/release-check.sh`, the
+  `git archive` tarball check with the consumer smoke inside the
+  extracted package), advisory live lane with avahi (`zig build live --
+  --seconds 3`), advisory fuzz lane (`--fuzz=1M`, 20 min cap). All
+  actions SHA-pinned. `justfile` recipes for all of it, `tools/
+  release-check.sh` with the `v` tag prefix.
+
+### Known limitations
+
+- No per-link re-probe on interface add (RFC 6762 §8 "Link Change"):
+  two announcements instead. M6.
+- `_services._dns-sd._udp` meta-query, `_sub` subtypes, §7.3 / §7.4
+  duplicate suppression, §10.3-§10.5 cache flush on topology change and
+  POOF, v6 address-flag filtering. M6.
+- The Mac / Lima two-peer demo needs a bridged VM network; Lima's
+  user-mode NIC does not carry multicast.
+- FreeBSD and OpenBSD compile with reviewed constants; not run.
+
+### Milestone record
+
+The development history behind the summary, newest first.
+
+#### M5 - loop modes, lookup, profiles, flood guards, docs
+
+- Queued mutations (plan §4.2, Revision 7 item 7 closed): `advertise`,
+  `updateTxt`, `withdraw`, `browse` and `stopBrowse` go through
+  `Service.PendingMutation` (64 slots, ~26 KB inline in the Service;
+  a full queue applies at once with the last tick's clock rather than
+  losing the mutation). `advertise` returns its `RegId` from
+  `Engine.reserveRegistration` (the slot holds the validated copy, the
+  queue carries only the id); `browse` returns its `BrowseId` from
+  `Engine.reserveBrowse` (slot and duplicate check taken, no timer) and
+  `startBrowse` at the next tick schedules the 20-120 ms first query
+  and runs the warm start from that tick's clock. `updateTxt` carries
+  the built `Txt`. Tests: `advertise before first tick starts probing at
+  first tick`, `stopBrowse is applied at the next tick`, `browse before
+  the first tick is scheduled at that tick`, `reserved browse holds its
+  slot without a timer until started`.
+- `serve` (mode C) and `Mailbox`: `Mailbox.put` with the plan's full
+  policy, `warning.events_dropped` once, `isClosed` polled each
+  iteration. Behaviour change vs M4: `serve` withdraws every
+  registration and runs the goodbye flush on BOTH exits (closed mailbox
+  -> normal return; `Group.cancel` -> `error.Canceled`), so a program
+  that closes the mailbox and serves again must advertise again.
+  `Group.concurrent` on `Threaded.global_single_threaded` returns
+  `error.ConcurrencyUnavailable` before `serve` runs (verified: its own
+  `Task.create` with the `.failing` allocator).
+- `lookup(type, {timeout_us, quiet_us}, out)`: the M3.1 code deduped per
+  `(instance, type)` across interfaces despite Revision 6 item 1; it is
+  now per `(instance, type, ifindex)` (`mergeResolved`, test `lookup
+  keeps one slot per instance per interface`). Size `out` by instances
+  x interfaces; `mdns-browse --once` prints one line per interface.
+- Darwin: with `IP_MULTICAST_IF` unset, a v4 multicast `sendmsg` whose
+  `IP_PKTINFO` names `lo0` succeeds once and then fails `ENETUNREACH`
+  forever (C-verified on macOS 26; other interfaces unaffected). Every
+  v4 multicast send on Darwin is now preceded by a best-effort
+  `setsockopt(IP_MULTICAST_IF, ip_mreqn{ifindex, addr})`
+  (`Service.pktinfo_needs_multicast_if`); `docs/platform-matrix.md`
+  "macOS runs (M5)".
+- Profiles (`src/profiles/`): `qmsg`, `qmesh`, `studio` schemas,
+  `SeedSet` (one admission per `(id, epoch)`; when full it evicts the
+  entry admitted longest ago by a per-entry admission counter, which
+  holds after `forget` too; the review found the ring-cursor version
+  could evict the newest entry after a swap-remove), the import-graph
+  test. `docs/integration.md` for shared-studio (mode A from
+  `ss_tick`), qmesh-zig (`on_iteration`), qmsg (beside `Node.tick`) and
+  a foreign QUIC loop.
+- Flood guards (`tests/flood_guard_test.zig`, tier 1, simulated time):
+  a 24 h browse sends <= 36 queries per interface with gaps that double
+  up to 3600 s (+2 % jitter, so <= 3672 s); an idle advertised service
+  sends 3 probes + 2 announcements per pair and then nothing for a day;
+  a hundred simultaneous probers of one name converge to `Same`,
+  `Same (2)` .. `Same (100)` with 4950 renames in 3484 packets (3083
+  probes, 401 responses; busiest engine 50; bounds 4000 / 60), 543
+  backoffs, settled at 69 simulated seconds, 1.3-1.5 s of Debug wall
+  clock on this Mac (ReleaseSafe far under); bridged echoes never rename;
+  two browsers of one type get at most two answers in an hour (§7.1;
+  §7.3 between browsers is M6); a 1000-probe storm gets 41 multicast
+  defences (one per 250 ms) and, as QU, 1000 unicast replies at 125 B
+  each for 81 B probes (1.5x, asserted under 2x; see `SECURITY.md`).
+- Loopback tests (`tests/loop_test.zig`) use per-process names
+  (`_mdnszig-XXXX._udp`, `quiet-XXXX`, `loop-adv-XXXX`) so two suites on
+  one host cannot answer or rename each other's instances.
+- Suite time: the public-API test binary went from ~9 s to ~29 s in
+  Debug (the loopback tests sleep 2.5 s for the peer to probe and
+  announce: serve-goodbye ~3.5 s, lookup-quiet ~3.5 s, lookup-replace
+  ~5 s, mailbox-drop 2.5 s); Revision 6 item 10 asked to watch this.
+- Review fixes: the flood-guard summaries are `std.log.debug` (the
+  earlier `std.log.warn` and a wall-clock print made every green run
+  print `failed command`); `docs/conformance.md` rows for the M5 tests
+  flipped to `done` and rows added for the four flood guards and the
+  serve goodbye rule; `just tarball-check` resolves the pinned compiler
+  before leaving the checkout; the `lima-*` recipes use the ssh form.
+
+#### M4 - responder: registrations, probing, announcing, answering, conflicts, goodbyes
 
 - `src/core/responder.zig` (new): the sans-IO responder behind
   `Engine.advertise` / `withdraw` / `updateTxt`. Host A/AAAA per
@@ -120,7 +384,7 @@
   conflict renames us to `demo (2)`, ours-first makes avahi pick
   `demo #2`).
 
-### M4 examples and interop (plan section 7 M4 deliverables)
+#### M4 examples and interop (plan section 7 M4 deliverables)
 
 - `examples/advertise.zig` (`zig-out/bin/mdns-advertise`, `zig build
   example-advertise -- ...`): registers one instance from the command
@@ -170,7 +434,7 @@
   `peer-demo`, `interop-macos`, `interop-lima`, `flood-count`,
   `legacy-query` (`lima_ssh` variable for the ssh form).
 
-### M3 gate fixes - Darwin send window; per-interface cache
+#### M3 gate fixes - Darwin send window; per-interface cache
 
 - P1, `mdns-live` hang on macOS with the default interface set: the
   first `sendmsg` of a query round could sleep forever. xnu's
@@ -266,7 +530,7 @@
 - `tests/live/main.zig` header: if a run hangs, `sample <pid> 2` before
   killing it.
 
-### M3 - querier, cache, resolve join; Engine internals replace the stub
+#### M3 - querier, cache, resolve join; Engine internals replace the stub
 
 - `src/core/querier.zig`: browses with the RFC 6762 section 5.2 ladder
   (first query 20-120 ms, then 1 s doubling to 60 min, +0-2 % jitter),
@@ -346,7 +610,7 @@
   browse end to end through it (resolve, KA suppression, requery
   refresh, bad source port, unicast reply, goodbye, two queriers).
 
-### M2 - sockets, interfaces, Service shell; Linux column filled
+#### M2 - sockets, interfaces, Service shell; Linux column filled
 
 - `src/platform/ifaces.zig`: self-declared `getifaddrs`/`freeifaddrs`
   externs and `struct ifaddrs` layouts for Darwin, Linux (glibc and musl),
@@ -429,7 +693,7 @@
   the plan's Linux acceptance line needs systemd-resolved stopped as well
   as avahi on Fedora.
 
-### M1 - wire codec, fixtures, fuzz
+#### M1 - wire codec, fixtures, fuzz
 
 - `src/wire/*` (`mdns.wire`, with `Bounded`, `Name`, `Txt`, `TxtPair`
   re-exported at the top level): the zero-allocation codec. `Name` with
@@ -524,7 +788,7 @@
     purpose: same `len`/`buf`/`slice()` shape, root by default, built only
     through validating constructors (documented on the type).
 
-### M0 - scaffold and first macOS spike
+#### M0 - scaffold and first macOS spike
 
 - Repo skeleton: `build.zig` (module `mdns`, links libc, refuses ReleaseFast
   and ReleaseSmall, early return for dependency builds, steps `test`, `live`,
@@ -588,7 +852,7 @@
   on blocking fds as well; the advisory fuzz CI lane is disabled until the
   first `std.testing.fuzz` target exists (M1).
 
-### Known risks
+#### Known risks
 
 - `std.Io.Threaded` completes a timed receive/send after `poll(2)` with an
   untimed `operate` whose `WouldBlock => unreachable` (`Threaded.zig:2555`,
@@ -598,5 +862,3 @@
   backend (M6, needs `O_NONBLOCK`) must mitigate first (accept-all BPF via
   `SO_ATTACH_FILTER`, or a backend fix upstream). See
   `docs/platform-matrix.md`, "Known risks and decisions for M2".
-
-## 0.1.0 - unreleased

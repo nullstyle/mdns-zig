@@ -35,17 +35,20 @@
 //!   allow-list zero joined interfaces is `warning.no_interfaces`, not an
 //!   error. Send failures are counted in `stats.tx_dropped`.
 //!
-//! Scope after M4: `browse`, `stopBrowse` and `lookup` drive the real
-//! querier; `advertise`, `withdraw` and `updateTxt` drive the real
-//! responder (`advertise` and `updateTxt` are validated and applied at
-//! the call, stamped like `browse`; `withdraw` is queued); `deinit`
-//! withdraws every registration and runs a bounded goodbye flush (two
-//! send rounds) before it leaves the groups and closes the sockets. The
-//! joined (ifindex, family) pairs are handed to the Engine with
-//! `Engine.setJoined` after every snapshot, so packets go out only where
-//! the join succeeded (Revision 5 item 1). `firstBinder()` reaches the
-//! Engine as `Options.first_binder` / `qu_allowed` (plan section 4.8
-//! "Port sharing"). Everything else is the final shape.
+//! Mutations (4.2): `advertise`, `updateTxt`, `withdraw`, `browse` and
+//! `stopBrowse` validate at the call and are applied at the start of the
+//! next `tick` / `step` with that tick's clock (`PendingMutation`);
+//! `advertise` and `browse` still return their ids at once because the
+//! Engine reserves the slot without scheduling
+//! (`Engine.reserveRegistration`, `Engine.reserveBrowse`), so the
+//! 20-120 ms first-query delay and the 0-250 ms first-probe delay both
+//! count from that tick's clock. `deinit` and both exits of `serve`
+//! withdraw every registration and run a bounded goodbye flush (two send
+//! rounds). The joined (ifindex, family) pairs are handed to the Engine
+//! with `Engine.setJoined` after every snapshot, so packets go out only
+//! where the join succeeded (Revision 5 item 1). `firstBinder()` reaches
+//! the Engine as `Options.first_binder` / `qu_allowed` (plan section 4.8
+//! "Port sharing").
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -65,6 +68,7 @@ pub const Stats = events.Stats;
 pub const Resolved = events.Resolved;
 pub const ServiceDesc = events.ServiceDesc;
 pub const TxtPair = events.TxtPair;
+pub const Txt = events.Txt;
 pub const RegId = events.RegId;
 pub const BrowseId = events.BrowseId;
 pub const Family = events.Family;
@@ -405,10 +409,21 @@ pub const Service = struct {
         window_opened: u64 = 0,
     };
 
-    const PendingMutation = union(enum) {
+    /// A validated mutation waiting for the next tick's clock (plan
+    /// section 4.2). The `advertise` payload lives in the Engine's
+    /// reserved slot; the `updateTxt` payload is the built TXT (at most
+    /// 400 B), so the queue is about 26 KB inside the Service.
+    pub const PendingMutation = union(enum) {
+        start_registration: RegId,
+        update_txt: struct { id: RegId, txt: Txt },
         withdraw: RegId,
+        start_browse: BrowseId,
         stop_browse: BrowseId,
     };
+    /// Mutations that fit between two ticks (every registration plus
+    /// every browse plus slack). A full queue applies the mutation at
+    /// once with `mutationClock()` instead of losing it.
+    pub const max_pending_mutations = 64;
 
     /// Join bookkeeping per interface in `table`, same index order.
     const JoinState = struct {
@@ -453,7 +468,7 @@ pub const Service = struct {
     svc_events: engine_mod.EventQueue,
     svc_events_dropped: u64,
 
-    pending: events.Bounded(PendingMutation, 64),
+    pending: events.Bounded(PendingMutation, max_pending_mutations),
 
     // ---- clock ---------------------------------------------------------
     origin: Io.Timestamp,
@@ -850,21 +865,24 @@ pub const Service = struct {
     // ---- mutations -----------------------------------------------------
     //
     // Plan 4.2: "The Service queues them and applies them at the start of
-    // the next tick". `withdraw` and `stopBrowse` go through
-    // `PendingMutation`. `advertise`, `updateTxt` and `browse` validate
-    // their input at the call (the caller wants the typed error at once)
-    // and stamp the Engine with `mutationClock()`: the last tick's clock
-    // in mode A, else `nowUs()`. The Engine only schedules from that
-    // stamp (a probe 0-250 ms later, a browse 20-120 ms later); nothing
-    // goes out before the next `tick` / `step`, which is the observable
-    // half of the contract. M5 may still move the data copy into
-    // `PendingMutation` for the queued half.
+    // the next tick" with that tick's `now_us`. `advertise`, `updateTxt`,
+    // `withdraw`, `browse` and `stopBrowse` all go through
+    // `PendingMutation`; the typed errors and the ids are still returned
+    // at the call (the Engine validates and reserves without scheduling).
+    // Only a full queue applies a mutation at the call, stamped with
+    // `mutationClock()`. Nothing goes out before the next `tick` /
+    // `step` in either case, which is the observable half of the
+    // contract.
 
-    /// Register one service instance. Validated now; probing starts at
-    /// the next `tick` / `step` (RFC 6762 section 8.1). `registered`
-    /// arrives through `poll` about 1.75-2 s later.
+    /// Register one service instance. Validated now (RFC 6335 type,
+    /// instance 1-63 octets, TXT at most 400 B, duplicate, pool limit)
+    /// and its id returned now; probing starts at the next `tick` /
+    /// `step` with that tick's clock (RFC 6762 section 8.1).
+    /// `registered` arrives through `poll` about 1.75-2 s later.
     pub fn advertise(s: *Service, desc: ServiceDesc) AdvertiseError!RegId {
-        return s.engine.advertise(desc, s.mutationClock());
+        const id = try s.engine.reserveRegistration(desc);
+        s.queueMutation(.{ .start_registration = id });
+        return id;
     }
 
     /// Queued; applied at the start of the next `tick` / `step` (goodbye
@@ -874,46 +892,67 @@ pub const Service = struct {
     }
 
     /// Replace the TXT (RFC 6762 section 8.4: two announcements, no
-    /// probe). Validated now; announced at the next `tick` / `step`.
+    /// probe). Validated and encoded now; applied at the next `tick` /
+    /// `step`. Identical rdata is a no-op there.
     pub fn updateTxt(s: *Service, id: RegId, txt: []const TxtPair) UpdateTxtError!void {
-        return s.engine.updateTxt(id, txt, s.mutationClock());
+        if (!s.engine.hasRegistration(id)) return error.UnknownRegistration;
+        const built = Txt.build(txt) catch |err| return switch (err) {
+            error.TxtTooLarge => error.TxtTooLarge,
+            error.TxtStringTooLong, error.InvalidTxtKey => error.InvalidTxt,
+        };
+        s.queueMutation(.{ .update_txt = .{ .id = id, .txt = built } });
     }
 
-    /// The clock a mutation is stamped with: the last tick's `now_us` in
-    /// mode A (the embedder's clock is authoritative), else `nowUs()`
-    /// (never below `last_now_us`). `last_now_us` itself is untouched.
+    /// The clock the queue-full fallback stamps a mutation with: the
+    /// last tick's `now_us` in mode A (the embedder's clock is
+    /// authoritative), else `nowUs()` (never below `last_now_us`).
+    /// `last_now_us` itself is untouched.
     fn mutationClock(s: *const Service) u64 {
         return if (s.mode == .tick) s.last_now_us else @max(s.last_now_us, s.nowUs());
     }
 
-    /// Start a browse; the first query goes out 20-120 ms later, at the
-    /// next `tick` / `step`. In mode A the browse is stamped with the
-    /// last tick's clock (`last_now_us`). Before the first call and in
-    /// modes B/C it is stamped with `nowUs()` (never below
-    /// `last_now_us`), so the 20-120 ms delay counts from the call, not
-    /// from `init` (the `init` -> `browse` -> `run` pattern of
-    /// `examples/browse.zig`). `last_now_us` itself is untouched: a mode
-    /// A embedder whose clock starts near zero is not pushed forward.
+    /// Start a browse. Validated now (RFC 6335 type, duplicate, pool
+    /// limit) and its `BrowseId` returned now (`Engine.reserveBrowse`);
+    /// scheduled at the next `tick` / `step` with that tick's clock, so
+    /// the 20-120 ms first-query delay (RFC 6762 section 5.2) counts
+    /// from that tick: in mode A from the embedder's own clock, in modes
+    /// B/C from the first `step` after the call (the `init` -> `browse`
+    /// -> `run` pattern of `examples/browse.zig` loses nothing). Until
+    /// that tick `nextDeadline` does not see the browse. A second browse
+    /// of the same type is `error.DuplicateBrowse` (Revision 6 item 5).
     pub fn browse(s: *Service, service_type: []const u8) BrowseError!BrowseId {
-        return s.engine.browse(service_type, s.mutationClock());
+        const id = try s.engine.reserveBrowse(service_type);
+        s.queueMutation(.{ .start_browse = id });
+        return id;
     }
 
-    /// Queued; applied at the start of the next `tick` / `step`.
+    /// Queued; applied at the start of the next `tick` / `step`. Until
+    /// then the schedule and the `found` / `lost` stream continue.
     pub fn stopBrowse(s: *Service, id: BrowseId) void {
         s.queueMutation(.{ .stop_browse = id });
     }
 
+    /// Mutations queued and not yet applied (tests).
+    pub fn pendingCount(s: *const Service) usize {
+        return s.pending.len;
+    }
+
     fn queueMutation(s: *Service, m: PendingMutation) void {
         s.pending.append(m) catch {
-            // Queue full: apply now with the last known time rather than
+            // Queue full: apply now, stamped like `browse`, rather than
             // lose the mutation.
-            s.applyMutation(m, s.last_now_us);
+            s.applyMutation(m, s.mutationClock());
         };
     }
 
     fn applyMutation(s: *Service, m: PendingMutation, now_us: u64) void {
         switch (m) {
+            .start_registration => |id| s.engine.startRegistration(id, now_us),
+            // The id was checked at the call; a withdraw queued in
+            // between makes it unknown, which is then the right answer.
+            .update_txt => |u| s.engine.updateTxtBuilt(u.id, u.txt, now_us) catch {},
             .withdraw => |id| s.engine.withdraw(id, now_us),
+            .start_browse => |id| s.engine.startBrowse(id, now_us),
             .stop_browse => |id| s.engine.stopBrowse(id, now_us),
         }
     }
@@ -1014,19 +1053,35 @@ pub const Service = struct {
     // ---- mode C ------------------------------------------------------------
 
     /// Mode C: mode B as an `Io.Group` task, pushing every event into
-    /// `mailbox` with the bounded-put-then-drop-oldest policy. Start it
-    /// with `Group.concurrent`, never `Group.async`. Returns
-    /// `error.Canceled` after `Group.cancel`; returns normally once the
-    /// mailbox is closed, at most one step cap after `Mailbox.close`
-    /// (goodbyes are M4). A fatal step error does not end delivery: it is
-    /// counted in `rxCounters().fatal_errors` and the task sleeps one
-    /// step cap (`backOffAfterFault`) before the next step, because
-    /// Threaded returns a failing receive before any timed wait
+    /// `mailbox` with the bounded-put-then-drop-oldest policy (plan 4.3).
+    /// Start it with `Group.concurrent`, never `Group.async`: on a
+    /// single-threaded `Io` `Group.concurrent` itself returns
+    /// `error.ConcurrencyUnavailable` and `serve` never runs.
+    ///
+    /// Two exits, both after a bounded goodbye flush (every registration
+    /// withdrawn, two send rounds, as in `deinit`): `error.Canceled`
+    /// after `Group.cancel` (the cancel lands on the next receive, sleep
+    /// or queue operation; under Threaded it is one-shot, so the flush's
+    /// sends go through), and a normal return once the mailbox is closed,
+    /// at most one step cap after `Mailbox.close`. After either exit the
+    /// Service holds no registrations; `advertise` again before serving
+    /// again.
+    ///
+    /// A fatal step error does not end delivery: it is counted in
+    /// `rxCounters().fatal_errors` and the task sleeps one step cap
+    /// (`backOffAfterFault`) before the next step, because Threaded
+    /// returns a failing receive before any timed wait
     /// (Threaded.zig:2826-2843) and a persistent local fault would
     /// otherwise spin this task at full CPU. The sleep is also a
     /// cancelation point.
     pub fn serve(s: *Service, mailbox: *Mailbox) ServeError!void {
         s.bindMode(.step);
+        const result = s.serveLoop(mailbox);
+        s.goodbyeFlush();
+        return result;
+    }
+
+    fn serveLoop(s: *Service, mailbox: *Mailbox) ServeError!void {
         const cap: Io.Duration = .fromMicroseconds(max_step_cap_us);
         while (true) {
             if (try mailbox.isClosed(s.io)) return;
@@ -1045,6 +1100,9 @@ pub const Service = struct {
                     };
                 }
             }
+            // The plan's full policy, last step: after the first drop
+            // `serve` says so once, through the same mailbox. The
+            // counter is mirrored into `stats().events_dropped`.
             if (mailbox.dropped != s.mailbox_dropped) {
                 s.mailbox_dropped = mailbox.dropped;
                 if (!s.events_dropped_warned) {
@@ -1053,6 +1111,7 @@ pub const Service = struct {
                         error.Closed => return,
                         error.Canceled => return error.Canceled,
                     };
+                    s.mailbox_dropped = mailbox.dropped;
                 }
             }
         }
@@ -1066,23 +1125,26 @@ pub const Service = struct {
         try (Io.Clock.Duration{ .raw = .fromMicroseconds(max_step_cap_us), .clock = .awake }).sleep(s.io);
     }
 
-    /// Bounded one-shot lookup (mode B): browse, collect `resolved` into
-    /// `out`, stop the browse on every exit path. One slot per instance
-    /// (plan section 5): a later `resolved` for the same instance
-    /// replaces the earlier copy, whichever interface it came from, so
-    /// a responder heard on k interfaces fills one slot with the
-    /// addresses of the interface that resolved it last (`Resolved.
-    /// ifindex` says which) and `out` sized by the expected instance
-    /// count is enough. The per-interface stream (one `resolved` per
-    /// interface) is what `browse` gives. Returns when `out` is full,
-    /// after `timeout_us`, or after `quiet_us` with at least one result
-    /// and no new `resolved`.
+    /// Bounded one-shot lookup (mode B, plan section 5 "Rules behind the
+    /// sketch"): browse, loop `step` with a cap of at most 250 ms,
+    /// collect `resolved` into `out`, stop the browse on every exit path.
+    /// One slot per `(instance, type, ifindex)` (Revision 6 item 1: the
+    /// cache and the `resolved` stream are per interface, so a responder
+    /// heard on k interfaces fills k slots, each with that link's
+    /// addresses); a later `resolved` for the same key replaces the
+    /// earlier copy. Every other event is discarded for the duration of
+    /// the call. Returns when `out` is full, after `timeout_us`, or
+    /// after `quiet_us` with at least one result and no new `resolved`.
+    /// `error.Canceled` after `Group.cancel`, `error.DuplicateBrowse`
+    /// when a browse of that type is active (use a separate Service).
+    /// The browse is stopped through `Engine.stopBrowse` directly, not
+    /// the queued `stopBrowse`, so no later tick is needed.
     pub fn lookup(s: *Service, service_type: []const u8, opts: LookupOptions, out: []Resolved) LookupError!usize {
         s.bindMode(.step);
         const start = s.nowUs();
         s.advanceClock(start);
         const id = try s.engine.browse(service_type, start);
-        defer s.engine.stopBrowse(id, s.nowUs());
+        defer s.engine.stopBrowse(id, @max(s.last_now_us, s.nowUs()));
 
         var count: usize = 0;
         var last_new = start;
@@ -1091,8 +1153,10 @@ pub const Service = struct {
             const now = s.nowUs();
             if (now - start >= opts.timeout_us) break;
             if (count > 0 and now - last_new >= opts.quiet_us) break;
-            const remaining = @min(opts.timeout_us - (now - start), max_step_cap_us);
-            try s.stepInner(.fromMicroseconds(@intCast(remaining)));
+            var budget = opts.timeout_us - (now - start);
+            if (count > 0) budget = @min(budget, opts.quiet_us - (now - last_new));
+            const cap = @min(budget, max_step_cap_us);
+            try s.stepInner(.fromMicroseconds(@intCast(cap)));
             while (true) {
                 const n = s.poll(&buf);
                 if (n == 0) break;
@@ -1106,13 +1170,12 @@ pub const Service = struct {
         return count;
     }
 
-    /// `lookup`'s collect rule: `r` replaces the slot of the same
-    /// instance (name and type, any interface) or takes the next free
-    /// one. Returns the new count. Pure, so it is unit-tested without a
-    /// socket.
+    /// `lookup`'s collect rule: `r` replaces the slot with the same
+    /// instance, type and interface, or takes the next free one. Returns
+    /// the new count. Pure, so it is unit-tested without a socket.
     fn mergeResolved(out: []Resolved, count: usize, r: Resolved) usize {
         for (out[0..count]) |*o| {
-            if (o.instance.eql(&r.instance) and o.service_type.eql(&r.service_type)) {
+            if (o.ifindex == r.ifindex and o.instance.eql(&r.instance) and o.service_type.eql(&r.service_type)) {
                 o.* = r;
                 return count;
             }
@@ -1324,6 +1387,11 @@ pub const Service = struct {
                         return;
                     };
                 } else {
+                    if (comptime pktinfo_needs_multicast_if) {
+                        // Best effort: the pktinfo send below worked on
+                        // every non-loopback interface without it.
+                        so.setMulticastIf(sock.handle, .v4, d.ifindex, s.ifaceV4Addr(d.ifindex)) catch {};
+                    }
                     control = so.encodePktInfo4(&s.tx_ctrl, d.ifindex, null) catch &.{};
                 }
             },
@@ -1355,6 +1423,18 @@ pub const Service = struct {
         };
         if (n != 1) s.tx_dropped += 1;
     }
+
+    /// XNU quirk (M5, verified with a C spike on macOS 26): while the
+    /// socket's `IP_MULTICAST_IF` is unset, a v4 multicast `sendmsg`
+    /// whose `IP_PKTINFO` names the loopback interface succeeds once and
+    /// then fails with `ENETUNREACH` on every later send (the socket's
+    /// cached route no longer matches the pktinfo interface); other
+    /// interfaces are unaffected. Setting `IP_MULTICAST_IF` to the egress
+    /// interface before the send resets that cache and makes the pktinfo
+    /// sends repeatable on every interface, loopback included. So on
+    /// Darwin every v4 multicast send is preceded by that `setsockopt`;
+    /// the pktinfo cmsg still steers the interface as before.
+    const pktinfo_needs_multicast_if = builtin.os.tag.isDarwin();
 
     fn ifaceV4Addr(s: *const Service, ifindex: u32) ?[4]u8 {
         const iface = s.table.find(ifindex) orelse return null;
@@ -1455,8 +1535,8 @@ test "tick drains sockets only after rx_poll_interval_us" {
             else => return err,
         };
         defer svc.deinit();
-        try svc.tick(0);
         _ = try svc.browse("_x._udp");
+        try svc.tick(0);
         const due = svc.nextDeadline(0).?;
         try testing.expect(due >= 20_000 and due <= 120_000);
         try svc.tick(due - 1);
@@ -1483,7 +1563,8 @@ test "tick drains sockets only after rx_poll_interval_us" {
 
 test "tick mode then step mode asserts in debug" {
     // `std.testing` cannot catch `std.debug.assert`; the clock-source
-    // rule is a pure function that `tick`/`step` assert on.
+    // rule (plan 4.3) is the pure function `modeAfter`, and `bindMode`
+    // asserts on its null. First the function:
     try testing.expectEqual(@as(?Mode, .tick), modeAfter(.unset, .tick));
     try testing.expectEqual(@as(?Mode, .step), modeAfter(.unset, .step));
     try testing.expectEqual(@as(?Mode, .tick), modeAfter(.tick, .tick));
@@ -1491,6 +1572,51 @@ test "tick mode then step mode asserts in debug" {
     // The other mode after the first call is the assertion case.
     try testing.expectEqual(@as(?Mode, null), modeAfter(.tick, .step));
     try testing.expectEqual(@as(?Mode, null), modeAfter(.step, .tick));
+
+    // Then the wiring, on real Services: every entry point binds its
+    // mode (so a later call in the other mode would hit the assert),
+    // and mutations bind nothing.
+    {
+        var svc = try initUnjoinedOrSkip();
+        defer svc.deinit();
+        try testing.expectEqual(Mode.unset, svc.mode);
+        _ = try svc.browse("_x._udp");
+        _ = try svc.advertise(.{ .service_type = "_y._udp", .instance = "m", .port = 1 });
+        try testing.expectEqual(Mode.unset, svc.mode);
+        try svc.tick(0);
+        try testing.expectEqual(Mode.tick, svc.mode);
+        try svc.tick(1);
+        try testing.expectEqual(Mode.tick, svc.mode);
+    }
+    {
+        var svc = try initUnjoinedOrSkip();
+        defer svc.deinit();
+        try svc.step(.fromMilliseconds(2));
+        try testing.expectEqual(Mode.step, svc.mode);
+    }
+    {
+        var svc = try initUnjoinedOrSkip();
+        defer svc.deinit();
+        var out: [1]Resolved = undefined;
+        _ = try svc.lookup("_x._udp", .{ .timeout_us = 2_000, .quiet_us = 1_000 }, &out);
+        try testing.expectEqual(Mode.step, svc.mode);
+    }
+    {
+        var svc = try initUnjoinedOrSkip();
+        defer svc.deinit();
+        var shutdown: std.atomic.Value(bool) = .init(true);
+        try svc.run(&shutdown, null);
+        try testing.expectEqual(Mode.step, svc.mode);
+    }
+    {
+        var svc = try initUnjoinedOrSkip();
+        defer svc.deinit();
+        var mbuf: [4]Event = undefined;
+        var mailbox: Mailbox = .init(&mbuf);
+        mailbox.close(testing.io);
+        try svc.serve(&mailbox);
+        try testing.expectEqual(Mode.step, svc.mode);
+    }
 }
 
 test "clampToDeadline rounds up and caps at 250 ms" {
@@ -1684,23 +1810,35 @@ test "no_packets_10s warning ignores own echoes" {
     try testing.expectEqual(@as(usize, 0), svc.poll(&evs));
 }
 
-test "browse before the first step is stamped with the current clock" {
-    // `init` -> `browse` -> `run`: the 20-120 ms first-query delay
-    // counts from the browse call, not from `init` (mode unset, and
-    // modes B/C). `last_now_us` stays 0 for a mode A embedder.
+test "browse before the first tick is scheduled at that tick" {
+    // Plan 4.2: a Service mutation carries no clock. `init` -> `browse`
+    // -> first tick: the browse is reserved at the call (its id and the
+    // duplicate check are synchronous) and scheduled by the first tick
+    // with THAT tick's clock, so the 20-120 ms first-query delay counts
+    // from the embedder's `now_us`, not from `nowUs()` at the call (a
+    // mode A clock far from the Service's own awake clock is the point).
     var svc = try initUnjoinedOrSkip();
     defer svc.deinit();
     (Io.Clock.Duration{ .raw = .fromMilliseconds(150), .clock = .awake }).sleep(testing.io) catch |err| switch (err) {
         error.Canceled => return error.SkipZigTest,
     };
-    const before = svc.nowUs();
-    try testing.expect(before >= 150_000);
+    try testing.expect(svc.nowUs() >= 150_000);
     _ = try svc.browse("_x._udp");
-    const due = svc.nextDeadline(before).?;
-    try testing.expect(due >= before + 20_000);
-    try testing.expect(due <= svc.nowUs() + 120_000);
+    try testing.expectError(error.DuplicateBrowse, svc.browse("_x._udp"));
+    try testing.expectEqual(@as(usize, 1), svc.engine.browseCount());
+    try testing.expectEqual(@as(usize, 1), svc.pendingCount());
+    try testing.expectEqual(@as(?u64, null), svc.nextDeadline(svc.nowUs()));
     try testing.expectEqual(@as(u64, 0), svc.last_now_us);
     try testing.expectEqual(Mode.unset, svc.mode);
+    // An embedder clock far above `nowUs()`: the first query is due
+    // 20-120 ms after this tick, never at once.
+    const t1: u64 = 1_000_000_000_000;
+    try svc.tick(t1);
+    try testing.expectEqual(@as(usize, 0), svc.pendingCount());
+    const due = svc.nextDeadline(t1).?;
+    try testing.expect(due >= t1 + 20_000);
+    try testing.expect(due <= t1 + 120_000);
+    try testing.expectEqual(@as(u64, 0), svc.stats().tx);
 }
 
 const CancelProbe = struct {
@@ -1830,14 +1968,14 @@ test "serve backs off one step cap after a fatal step error" {
     try testing.expectEqual(@as(u64, 0), svc.rxCounters().truncated);
 }
 
-test "lookup keeps one slot per instance across interfaces" {
-    // Plan section 5: "a second `resolved` for the same instance replaces
-    // the earlier copy". With the per-interface cache a multi-homed
-    // responder emits one `resolved` per interface; `lookup` collapses
-    // them into one slot (the last one wins, its `ifindex` says which
-    // link's addresses it carries), so `out` sized by the expected
-    // instance count cannot run out on a multi-homed querier. A second
-    // instance takes the next slot and a full `out` drops the rest.
+test "lookup keeps one slot per instance per interface" {
+    // Plan section 5 as amended by Revision 6 item 1: `lookup` keeps one
+    // `Resolved` per `(instance, type, ifindex)`. With the per-interface
+    // cache a multi-homed responder emits one `resolved` per interface,
+    // each carrying only that link's addresses, and `lookup` keeps them
+    // all; a re-emit for the same key (a TXT change, an address change)
+    // replaces the earlier copy in place. A second instance takes the
+    // next slot and a full `out` drops the rest.
     const Name = @import("wire/root.zig").Name;
     const demo = try Name.parse("demo._qmsg._udp.local");
     const other = try Name.parse("other._qmsg._udp.local");
@@ -1849,26 +1987,65 @@ test "lookup keeps one slot per instance across interfaces" {
     try on4.addrs.append(.{ .ip4 = .{ .bytes = .{ 10, 0, 4, 7 }, .port = 0 } });
     const second: Resolved = .{ .instance = other, .service_type = stype, .host = host, .port = 1, .ifindex = 3, .ttl_s = 120 };
 
-    var out: [2]Resolved = undefined;
+    var out: [3]Resolved = undefined;
     var count: usize = 0;
     count = Service.mergeResolved(&out, count, on3);
     try testing.expectEqual(@as(usize, 1), count);
+    // The same instance on another interface is a second slot.
     count = Service.mergeResolved(&out, count, on4);
-    try testing.expectEqual(@as(usize, 1), count);
-    try testing.expectEqual(@as(u32, 4), out[0].ifindex);
-    try testing.expectEqual([4]u8{ 10, 0, 4, 7 }, out[0].addrs.slice()[0].ip4.bytes);
-    count = Service.mergeResolved(&out, count, second);
-    try testing.expectEqual(@as(usize, 2), count);
-    try testing.expectEqual(@as(u16, 1), out[1].port);
-    // A re-emit on interface 3 replaces the same slot again.
-    count = Service.mergeResolved(&out, count, on3);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u32, 3), out[0].ifindex);
-    // Full: a third instance is dropped, the count is unchanged.
+    try testing.expectEqual(@as(u32, 4), out[1].ifindex);
+    // A re-emit on interface 3 with new data replaces slot 0 in place.
+    var on3b = on3;
+    on3b.port = 4434;
+    count = Service.mergeResolved(&out, count, on3b);
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(u16, 4434), out[0].port);
+    try testing.expectEqual([4]u8{ 10, 0, 3, 7 }, out[0].addrs.slice()[0].ip4.bytes);
+    try testing.expectEqual(@as(u16, 4433), out[1].port);
+    // Another instance takes the next slot.
+    count = Service.mergeResolved(&out, count, second);
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expectEqual(@as(u16, 1), out[2].port);
+    // Full: a new key is dropped, the count is unchanged; a known key
+    // still replaces.
     var third = second;
     third.instance = try Name.parse("third._qmsg._udp.local");
     count = Service.mergeResolved(&out, count, third);
-    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(usize, 3), count);
+    count = Service.mergeResolved(&out, count, on3);
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expectEqual(@as(u16, 4433), out[0].port);
+}
+
+test "stats sums Engine and Service counters" {
+    // Plan section 5 "stats": `Engine.stats()` plus the Service's own
+    // send drops (timed sends, the send window) and event drops (the
+    // Mailbox in mode C, the Service warning queue). Every other field
+    // passes through untouched.
+    var svc = try initUnjoinedOrSkip();
+    defer svc.deinit();
+    const base = svc.engine.stats();
+    try testing.expectEqual(base, svc.stats());
+    svc.tx_dropped = 5;
+    svc.mailbox_dropped = 7;
+    svc.svc_events_dropped = 2;
+    var st = svc.stats();
+    try testing.expectEqual(base.tx_dropped + 5, st.tx_dropped);
+    try testing.expectEqual(base.events_dropped + 9, st.events_dropped);
+    // An Engine-side drop (a responder job with no queue slot, the event
+    // ring) shows through the same fields.
+    svc.engine.counters.tx_dropped += 1;
+    svc.engine.counters.events_dropped += 1;
+    st = svc.stats();
+    try testing.expectEqual(base.tx_dropped + 6, st.tx_dropped);
+    try testing.expectEqual(base.events_dropped + 10, st.events_dropped);
+    // Pass-through: zero the summed fields and the rest is the Engine's.
+    var expected = svc.engine.stats();
+    expected.tx_dropped += 5;
+    expected.events_dropped += 9;
+    try testing.expectEqual(expected, st);
 }
 
 test "mailbox put drops oldest after the cap and counts" {

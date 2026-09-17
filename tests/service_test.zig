@@ -62,6 +62,9 @@ test "Service.init binds 5353 beside the OS daemon" {
     // away; a browse deadline is at most 120 ms away.
     if (svc.nextDeadline(svc.nowUs())) |d| try testing.expect(d >= svc.nowUs() + std.time.us_per_s);
     _ = try svc.browse("_mdns-zig-test._udp");
+    // Queued: the next step schedules it 20-120 ms from its own clock.
+    try testing.expectEqual(@as(?u64, null), svc.nextDeadline(svc.nowUs()));
+    try svc.step(.fromMilliseconds(2));
     const first = svc.nextDeadline(svc.nowUs()).?;
     try testing.expect(first <= svc.nowUs() + 120 * std.time.us_per_ms);
     var i: usize = 0;
@@ -117,10 +120,13 @@ test "mode A tick follows the embedder clock and the query ladder" {
     // No browse: a tick sends nothing.
     try svc.tick(1_000);
     try testing.expectEqual(@as(u64, 0), svc.stats().tx);
-    // A browse schedules its first query 20-120 ms after the last tick.
+    // A browse is queued; the next tick schedules its first query
+    // 20-120 ms after that tick's clock (plan 4.2).
     _ = try svc.browse("_mdns-zig-test._udp");
-    const first = svc.nextDeadline(1_000).?;
-    try testing.expect(first >= 1_000 + 20_000 and first <= 1_000 + 120_000);
+    try testing.expectEqual(@as(?u64, null), svc.nextDeadline(1_000));
+    try svc.tick(2_000);
+    const first = svc.nextDeadline(2_000).?;
+    try testing.expect(first >= 2_000 + 20_000 and first <= 2_000 + 120_000);
     try svc.tick(first - 1);
     try testing.expectEqual(@as(u64, 0), svc.stats().tx);
     try svc.tick(first);

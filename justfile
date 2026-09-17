@@ -11,7 +11,7 @@ fork_zig := env_var_or_default("MDNS_FORK_ZIG", env_var_or_default("HOME", "~") 
 # Lima VM that runs the cross-built Linux binaries. It mounts /Users/nullstyle,
 # so absolute paths from this checkout resolve unchanged inside the VM.
 lima_vm := env_var_or_default("MDNS_LIMA_VM", "zig-uring")
-# `limactl shell` hangs without a tty; the interop recipes use ssh with the
+# `limactl shell` hangs without a tty; every VM recipe uses ssh with the
 # VM's generated config instead.
 lima_ssh := "ssh -o IdentityAgent=none -o IdentitiesOnly=yes -F " + env_var_or_default("HOME", "~") + "/.lima/" + lima_vm + "/ssh.config lima-" + lima_vm
 linux_target := env_var_or_default("MDNS_LINUX_TARGET", "aarch64-linux-musl")
@@ -132,7 +132,7 @@ lima-browse *args:
     {{zig}} build examples -Dtarget={{linux_target}}
     args=({{args}})
     if [ "${args[0]:-}" = "--" ]; then args=("${args[@]:1}"); fi
-    limactl shell {{lima_vm}} -- timeout -s INT 10 "$PWD/zig-out/bin/mdns-browse" "${args[@]}"
+    {{lima_ssh}} "timeout -s INT 10 '$PWD/zig-out/bin/mdns-browse' ${args[*]}"
 
 # Run every diagnostic spike (bind5353, join_pktinfo, zero_timeout).
 spike-all:
@@ -158,21 +158,58 @@ check-fork:
 release-check ref="":
     sh tools/release-check.sh {{ref}}
 
+# Never `zig fetch .` here: ZIG_GLOBAL_CACHE_DIR lives inside the checkout
+# and the fetch would copy the cache into itself until NameTooLong. This
+# mirrors the CI quality lane: fetch a `git archive HEAD` export, extract
+# the package from the global cache, assert tests/, spikes/ and interop/
+# stayed out, copy tests/consumer in and run its tests in Debug and
+# ReleaseSafe against the extracted package (`.path = "../.."`).
+# Check the published tarball: filtered .paths plus the out-of-tree consumer smoke test.
+tarball-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src_dir="$(mktemp -d)"
+    git archive --format=tar HEAD | tar -x -C "${src_dir}"
+    pkg="$({{zig}} fetch "${src_dir}")"
+    # The cache dir and the pinned compiler come from mise.toml, which
+    # `mise exec` only honours inside this checkout: resolve both here,
+    # before the `cd` into the extracted package, or the consumer smoke
+    # below would run whatever zig the global mise config names.
+    cache_dir="$(mise exec -- sh -c 'printf %s "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}"')"
+    zig_bin="$(mise which zig)"
+    export ZIG_GLOBAL_CACHE_DIR="${cache_dir}"
+    package_archive="${cache_dir}/p/${pkg}.tar.gz"
+    echo "tarball-check: ${package_archive}"
+    test -f "${package_archive}"
+    package_dir="$(mktemp -d)"
+    tar -xzf "${package_archive}" -C "${package_dir}" --strip-components=1
+    test ! -e "${package_dir}/tests"
+    test ! -e "${package_dir}/spikes"
+    test ! -e "${package_dir}/interop"
+    test -f "${package_dir}/examples/browse.zig"
+    mkdir -p "${package_dir}/tests"
+    cp -R tests/consumer "${package_dir}/tests/consumer"
+    cd "${package_dir}/tests/consumer"
+    "${zig_bin}" build test
+    "${zig_bin}" build test -Doptimize=ReleaseSafe
+    echo "tarball-check: package ${pkg} OK (consumer smoke green in Debug and ReleaseSafe)"
+    rm -rf "${src_dir}" "${package_dir}"
+
 # Generate API docs into zig-out/docs.
 docs:
     {{zig}} build docs
 
 # `zig build test-exe` installs both test binaries under zig-out/test
-# without running them; `limactl shell` sees the same absolute path via
-# the /Users mount. The API tests read docs/ and tests/fixtures/ through
+# without running them; the VM sees the same absolute path via the
+# /Users mount (ssh form, see `lima_ssh` above). The API tests read docs/ and tests/fixtures/ through
 # build_options.repo_root, which is absolute, so they also work there.
 # Cross-build the unit and public-API tests for Linux (musl) and run them inside the Lima VM.
 lima-test optimize="Debug":
     #!/usr/bin/env bash
     set -euo pipefail
     {{zig}} build test-exe -Dtarget={{linux_target}} -Doptimize={{optimize}}
-    limactl shell {{lima_vm}} -- "$PWD/zig-out/test/mdns-unit-tests"
-    limactl shell {{lima_vm}} -- "$PWD/zig-out/test/mdns-api-tests"
+    {{lima_ssh}} "'$PWD/zig-out/test/mdns-unit-tests'"
+    {{lima_ssh}} "'$PWD/zig-out/test/mdns-api-tests'"
 
 # avahi-daemon (and, on Fedora, systemd-resolved) hold *:5353 in the VM,
 # so the expected line is `first_binder=false`; stop both services in the
@@ -187,7 +224,7 @@ lima-live *args:
     # and passes it through, so drop it here.
     args=({{args}})
     if [ "${args[0]:-}" = "--" ]; then args=("${args[@]:1}"); fi
-    limactl shell {{lima_vm}} -- "$PWD/zig-out/bin/mdns-live" "${args[@]}"
+    {{lima_ssh}} "'$PWD/zig-out/bin/mdns-live' ${args[*]}"
 
 # Each packet lands as <seq>.hex plus a .json sidecar; the sequence
 # restarts at 0001 every run, so the target directory must be empty (the

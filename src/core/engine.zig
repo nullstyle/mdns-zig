@@ -59,6 +59,7 @@ pub const Limits = events.Limits;
 pub const Stats = events.Stats;
 pub const ServiceDesc = events.ServiceDesc;
 pub const TxtPair = events.TxtPair;
+pub const Txt = events.Txt;
 pub const RegId = events.RegId;
 pub const BrowseId = events.BrowseId;
 pub const Family = events.Family;
@@ -452,6 +453,23 @@ pub const Engine = struct {
         return e.responder.advertise(&rx, desc, now_us);
     }
 
+    /// The validating half of `advertise`, without a clock: the typed
+    /// errors are returned now and the slot is taken (`Service.advertise`
+    /// returns this id synchronously), but nothing is scheduled until
+    /// `startRegistration`. Plan section 4.2: the Service applies the
+    /// start at its next tick with that tick's `now_us`.
+    pub fn reserveRegistration(e: *Engine, desc: ServiceDesc) AdvertiseError!RegId {
+        return e.responder.reserve(desc);
+    }
+
+    /// The scheduling half of `advertise`: start probing a reserved
+    /// registration from `now_us`. Any other id is ignored.
+    pub fn startRegistration(e: *Engine, id: RegId, now_us: u64) void {
+        var pairs: [max_pairs]querier_mod.Pair = undefined;
+        const rx = e.env(&pairs);
+        e.responder.start(&rx, id, now_us);
+    }
+
     /// Schedule a goodbye (TTL 0, RFC 6762 section 10.1) for the
     /// registration's records, and for the host's when it was the last
     /// one. Unknown ids are ignored.
@@ -478,6 +496,21 @@ pub const Engine = struct {
         return e.responder.updateTxt(&rx, id, txt, now_us);
     }
 
+    /// `updateTxt` with the rdata already encoded by `Txt.build`
+    /// (`Service.updateTxt` validates at the call and applies the built
+    /// TXT at its next tick).
+    pub fn updateTxtBuilt(e: *Engine, id: RegId, txt: Txt, now_us: u64) error{UnknownRegistration}!void {
+        var pairs: [max_pairs]querier_mod.Pair = undefined;
+        const rx = e.env(&pairs);
+        return e.responder.updateTxtBuilt(&rx, id, txt, now_us);
+    }
+
+    /// True while `id` names a live (reserved, probing, announcing or
+    /// established) registration.
+    pub fn hasRegistration(e: *const Engine, id: RegId) bool {
+        return e.responder.regState(id) != null;
+    }
+
     /// Live registrations.
     pub fn registrationCount(e: *const Engine) usize {
         return e.responder.count();
@@ -496,6 +529,18 @@ pub const Engine = struct {
     /// `now_us`, QM, on every joined pair.
     pub fn browse(e: *Engine, service_type: []const u8, now_us: u64) BrowseError!BrowseId {
         return e.querier.browse(service_type, now_us, e.sink());
+    }
+
+    /// The two halves of `browse` for the `Service`'s queued mutations
+    /// (plan section 4.2, like `reserveRegistration` / `startRegistration`):
+    /// validate and take the slot now, without a clock; schedule at the
+    /// next tick with that tick's `now_us`. `stopBrowse` frees a reserved
+    /// id like a started one.
+    pub fn reserveBrowse(e: *Engine, service_type: []const u8) BrowseError!BrowseId {
+        return e.querier.reserveBrowse(service_type);
+    }
+    pub fn startBrowse(e: *Engine, id: BrowseId, now_us: u64) void {
+        e.querier.startBrowse(id, now_us, e.sink());
     }
 
     /// Stop the query schedule and the `found` / `lost` / `resolved`

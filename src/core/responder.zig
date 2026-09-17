@@ -230,6 +230,11 @@ pub const State = enum(u8) {
     established,
     /// Registration only: goodbye queued, slot freed when it is built.
     withdrawn,
+    /// Registration only: validated and copied by `reserve`, probing not
+    /// started yet (`Service.advertise` queues the start for its next
+    /// tick, plan section 4.2). Invisible on the wire: never answered,
+    /// never probed, never compared in a tie-break, no deadline.
+    reserved,
 };
 
 /// Never multicast (rate table and TTL/4 rule).
@@ -728,7 +733,18 @@ pub const Responder = struct {
 
     /// Validate `desc`, copy it into a free slot and start probing
     /// (together with the host when nothing was registered yet).
+    /// `reserve` followed by `start`.
     pub fn advertise(r: *Responder, env: *const Env, desc: events.ServiceDesc, now_us: u64) AdvertiseError!RegId {
+        const id = try r.reserve(desc);
+        r.start(env, id, now_us);
+        return id;
+    }
+
+    /// The validating half of `advertise`: copy `desc` into a free slot
+    /// in state `.reserved` and return its id. Nothing is scheduled
+    /// until `start`. A reserved slot counts as live for `count` and the
+    /// duplicate check, and `withdraw` frees it silently.
+    pub fn reserve(r: *Responder, desc: events.ServiceDesc) AdvertiseError!RegId {
         wire.validateServiceName(desc.service_type) catch return error.InvalidServiceType;
         wire.validateInstance(desc.instance) catch return error.InvalidInstance;
         const type_name = querier_mod.Querier.serviceTypeName(desc.service_type) catch return error.InvalidServiceType;
@@ -756,7 +772,16 @@ pub const Responder = struct {
         };
         g.instance.appendSlice(desc.instance) catch unreachable; // validated <= 63
         g.service_type.appendSlice(desc.service_type[0..@min(desc.service_type.len, max_type_text_len)]) catch unreachable;
+        g.state = .reserved;
+        return idOf(slot);
+    }
 
+    /// The scheduling half of `advertise`: start probing a `.reserved`
+    /// registration from `now_us` (RFC 6762 section 8.1). Any other id
+    /// (unknown, withdrawn, already started) is ignored.
+    pub fn start(r: *Responder, env: *const Env, id: RegId, now_us: u64) void {
+        const g = r.regOfMut(id) orelse return;
+        if (g.state != .reserved) return;
         // Section 8.1: the host set is probed with the first registration
         // and shares its first delay so both go out in one packet.
         const delay = r.probeStartUs(env, now_us);
@@ -770,7 +795,6 @@ pub const Responder = struct {
         g.step = 0;
         g.losses = 0;
         g.next_us = delay;
-        return idOf(slot);
     }
 
     /// First probe time from `now_us`: the random 0-250 ms of section
@@ -874,11 +898,25 @@ pub const Responder = struct {
     /// the new TXT waits for the probe; over 400 B is rejected and the
     /// old TXT stays.
     pub fn updateTxt(r: *Responder, env: *const Env, id: RegId, pairs: []const TxtPair, now_us: u64) UpdateTxtError!void {
-        const g = r.regOfMut(id) orelse return error.UnknownRegistration;
+        if (r.regOf(id) == null) return error.UnknownRegistration;
         const txt = buildTxt(pairs) catch |err| return switch (err) {
             error.TxtTooLarge => error.TxtTooLarge,
             error.InvalidTxt => error.InvalidTxt,
         };
+        return r.updateTxtBuilt(env, id, txt, now_us);
+    }
+
+    /// `updateTxt` with the rdata already encoded (`Txt.build` validated
+    /// it): the half `Service.updateTxt` queues and applies at its next
+    /// tick (plan section 4.2).
+    pub fn updateTxtBuilt(r: *Responder, env: *const Env, id: RegId, txt: Txt, now_us: u64) error{UnknownRegistration}!void {
+        const g = r.regOfMut(id) orelse return error.UnknownRegistration;
+        if (g.state == .reserved) {
+            // Not started: nothing announced yet, so the new TXT simply
+            // becomes the one probed and announced by `start`.
+            g.txt = txt;
+            return;
+        }
         if (g.state == .probing) {
             if (g.txt.eql(&txt)) {
                 g.pending_txt = null;
@@ -1217,7 +1255,7 @@ pub const Responder = struct {
                 continue;
             }
             for (r.regs, 0..) |*g, i| {
-                if (!g.used or g.state == .withdrawn) continue;
+                if (!g.used or g.state == .withdrawn or g.state == .reserved) continue;
                 if (!rec.name.eql(&g.inst_name)) continue;
                 switch (rec.rtype) {
                     .srv => {
@@ -1333,7 +1371,7 @@ pub const Responder = struct {
                 continue;
             }
             for (r.regs, 0..) |*g, i| {
-                if (!g.used or g.state == .withdrawn) continue;
+                if (!g.used or g.state == .withdrawn or g.state == .reserved) continue;
                 if (!rec.name.eql(&g.inst_name)) continue;
                 if (g.owned()) {
                     const set = if (qu) &qu_set else &qm_set;

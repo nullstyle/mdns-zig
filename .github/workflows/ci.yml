@@ -68,10 +68,16 @@ jobs:
           key: zig-global-${{ runner.os }}-${{ hashFiles('build.zig.zon', 'mise.toml') }}
           restore-keys: zig-global-${{ runner.os }}-
 
-      # Hermetic tests only. Live-socket tests need Local Network permission
-      # on macOS 15+, which a CI runner does not grant.
+      # Hermetic tests only (plan section 8). The suite binds *:5353 (a
+      # refused bind skips), and MDNS_HERMETIC=1 also skips the loopback
+      # multicast tests in tests/loop_test.zig, which need Local Network
+      # permission on macOS 15+ that a CI runner may not grant; without
+      # it a runner that binds but does not deliver the multicast would
+      # fail them instead of skipping.
       - name: Run test suite
         run: zig build test -Doptimize=Debug
+        env:
+          MDNS_HERMETIC: "1"
 
   quality:
     name: Package and integration checks
@@ -97,7 +103,7 @@ jobs:
       - name: Check formatting
         run: |
           mise fmt --check
-          zig fmt --check build.zig src tests spikes
+          zig fmt --check build.zig src tests spikes examples
 
       - name: Release hygiene
         run: sh tools/release-check.sh "$GITHUB_REF"
@@ -131,6 +137,8 @@ jobs:
           tar -xzf "${package_archive}" -C "${package_dir}" --strip-components=1
           test ! -e "${package_dir}/tests"
           test ! -e "${package_dir}/spikes"
+          test ! -e "${package_dir}/interop"
+          test -f "${package_dir}/examples/browse.zig"
 
           mkdir -p "${package_dir}/tests"
           cp -R tests/consumer "${package_dir}/tests/consumer"
@@ -138,8 +146,10 @@ jobs:
           zig build test --cache-dir "${GITHUB_WORKSPACE}/.zig-cache/packaged-consumer"
           zig build test --cache-dir "${GITHUB_WORKSPACE}/.zig-cache/packaged-consumer" -Doptimize=ReleaseSafe
 
-  # Advisory: real sockets on the shared 5353 port next to avahi-daemon.
-  # `zig build live` is a placeholder until M2 (tests/live/).
+  # Advisory: real sockets on the shared 5353 port next to avahi-daemon
+  # (tests/live/main.zig -> mdns-live: bind, join, browse, advertise for
+  # a few seconds in mode B, print RESULT). The runner is never the first
+  # binder with avahi up, so this also covers the shared-port path.
   live:
     name: Live sockets (ubuntu, avahi, advisory)
     runs-on: ubuntu-latest
@@ -171,18 +181,18 @@ jobs:
           systemctl status avahi-daemon --no-pager || true
 
       - name: Run live-socket tests
-        run: zig build live
+        run: zig build live -- --seconds 3
 
-  # Advisory: coverage-guided fuzzing over the codec (plan section 8,
-  # tier 3; Engine.handle joins in M2+). A filtered test binary under
-  # --fuzz aborts the build runner (ziglang/zig#25352), so this runs the
-  # unfiltered suite. `-Duse-llvm=true` is required on this x86_64 runner:
-  # the self-hosted backend emits no sancov coverage and the fuzzer dies
-  # with "pcs_len was zero" (build.zig). Budget: `--fuzz=N` is N runs per
-  # target with no time flag; M1 measured 2M at about 58 s for the four
-  # codec targets on an M-series Mac (CHANGELOG), so 1M is the ~60 s
-  # calibration for the slower hosted runner. Recalibrate when targets are
-  # added.
+  # Advisory: coverage-guided fuzzing over the codec and Engine.handle
+  # (plan section 8, tier 3: six std.testing.fuzz targets). A filtered
+  # test binary under --fuzz aborts the build runner (ziglang/zig#25352),
+  # so this runs the unfiltered suite. `-Duse-llvm=true` is required on
+  # this x86_64 runner: the self-hosted backend emits no sancov coverage
+  # and the fuzzer dies with "pcs_len was zero" (build.zig). Budget:
+  # `--fuzz=N` is N runs per target with no time flag; M1 measured 2M at
+  # about 58 s for the four codec targets on an M-series Mac (CHANGELOG),
+  # so 1M is the ~60 s calibration for the slower hosted runner, and
+  # `timeout-minutes` bounds it. Recalibrate when targets are added.
   fuzz:
     name: Fuzz (advisory)
     runs-on: ubuntu-latest

@@ -145,9 +145,13 @@ pub const Question = struct {
 /// One active browse.
 pub const Browse = struct {
     used: bool = false,
+    /// Reserved by `reserveBrowse` and scheduled by `startBrowse`. A
+    /// reserved-only browse holds its slot and its type (duplicates are
+    /// refused) but has no timer.
+    started: bool = false,
     /// `<type>.local`.
     service_type: Name = .{},
-    /// When the next PTR query is due.
+    /// When the next PTR query is due (meaningful once `started`).
     next_query_us: u64 = 0,
     /// Interval before the *next* query after that (0 = first query
     /// pending; then 1 s, 2 s, ... capped, RFC 6762 section 5.2). It is
@@ -327,10 +331,21 @@ pub const Querier = struct {
     // ---- browses ------------------------------------------------------
 
     /// Start browsing `service_type` (`_qmsg._udp` form; RFC 6763 section
-    /// 7, RFC 6335 names). Emits `found` at once for every live PTR of
-    /// that type already in the cache (warm start) and schedules the
-    /// first query 20-120 ms from `now_us`.
+    /// 7, RFC 6335 names): `reserveBrowse` then `startBrowse` in one call.
+    /// Emits `found` at once for every live PTR of that type already in
+    /// the cache (warm start) and schedules the first query 20-120 ms
+    /// from `now_us`.
     pub fn browse(q: *Querier, service_type: []const u8, now_us: u64, sink: Sink) BrowseError!BrowseId {
+        const id = try q.reserveBrowse(service_type);
+        q.startBrowse(id, now_us, sink);
+        return id;
+    }
+
+    /// Validate `service_type` and take a browse slot without scheduling
+    /// anything (no clock needed): the `Service` queues the start for its
+    /// next tick (plan section 4.2). A second browse of the same type is
+    /// `error.DuplicateBrowse` from the reservation on.
+    pub fn reserveBrowse(q: *Querier, service_type: []const u8) BrowseError!BrowseId {
         wire.validateServiceName(service_type) catch return error.InvalidServiceType;
         const type_name = serviceTypeName(service_type) catch return error.InvalidServiceType;
         if (q.findBrowse(&type_name) != null) return error.DuplicateBrowse;
@@ -338,9 +353,22 @@ pub const Querier = struct {
         q.browses[slot] = .{
             .used = true,
             .service_type = type_name,
-            .next_query_us = now_us +| timers.queryFirstDelayUs(q.random),
-            .interval_us = 0,
         };
+        return @fromBackingInt(@as(u8, @intCast(slot)));
+    }
+
+    /// Schedule a reserved browse: the first query 20-120 ms from
+    /// `now_us`, plus the warm start. A stopped or already started id is
+    /// a no-op.
+    pub fn startBrowse(q: *Querier, id: BrowseId, now_us: u64, sink: Sink) void {
+        const slot: usize = @backingInt(id);
+        if (slot >= q.browses.len) return;
+        const b = &q.browses[slot];
+        if (!b.used or b.started) return;
+        b.started = true;
+        b.interval_us = 0;
+        b.next_query_us = now_us +| timers.queryFirstDelayUs(q.random);
+        const type_name = b.service_type;
         // Warm start: PTRs cached while nobody browsed (plan section 4.5).
         var it = q.cache.lookup(&type_name, .ptr, wire.class_in);
         while (it.next()) |e| {
@@ -356,7 +384,6 @@ pub const Querier = struct {
         }
         q.joinDirty(now_us, sink);
         q.recomputeDeadline();
-        return @fromBackingInt(@as(u8, @intCast(slot)));
     }
 
     /// Stop the schedule and the `found` / `lost` / `resolved` stream for
@@ -408,7 +435,7 @@ pub const Querier = struct {
     /// added: the new link has never seen our questions).
     pub fn restartSchedules(q: *Querier, now_us: u64) void {
         for (q.browses) |*b| {
-            if (!b.used) continue;
+            if (!b.used or !b.started) continue;
             b.interval_us = 0;
             b.next_query_us = now_us +| timers.queryFirstDelayUs(q.random);
         }
@@ -920,7 +947,7 @@ pub const Querier = struct {
         // its schedule untouched, so it retries at the next tick instead
         // of skipping a doubled step.
         for (q.browses) |*b| {
-            if (!b.used or b.next_query_us > now_us) continue;
+            if (!b.used or !b.started or b.next_query_us > now_us) continue;
             if (!q.addDue(.{ .name = b.service_type, .rtype = .ptr })) continue;
             b.interval_us = q.nextGapUs(b.interval_us);
             b.next_query_us = now_us +| b.interval_us;
@@ -1096,7 +1123,7 @@ pub const Querier = struct {
 
     fn recomputeDeadline(q: *Querier) void {
         var best: ?u64 = null;
-        for (q.browses) |*b| if (b.used) {
+        for (q.browses) |*b| if (b.used and b.started) {
             best = minOpt(best, b.next_query_us);
         };
         for (q.instances) |*inst| {
@@ -1289,6 +1316,64 @@ test "KA half-TTL filter" {
     q.due_len = 0;
     _ = q.addDue(.{ .name = name, .rtype = .srv });
     try testing.expect(!q.isKnownAnswer(e, 10, 1));
+}
+
+test "reserved browse holds its slot without a timer until started" {
+    var prng = std.Random.DefaultPrng.init(3);
+    var q = try Querier.init(testing.allocator, .{ .max_cache_records = 16, .max_browses = 2, .max_interfaces = 1 }, prng.random());
+    defer q.deinit(testing.allocator);
+    const Collector = struct {
+        found: usize = 0,
+        fn emit(ctx: *anyopaque, ev: Event) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            if (ev == .found) c.found += 1;
+        }
+    };
+    var col: Collector = .{};
+    const sink: Sink = .{ .ctx = &col, .emit = Collector.emit };
+    const pairs = [_]Pair{.{ .ifindex = 1, .family = .v4 }};
+
+    // A live PTR of the type sits in the cache before anyone browses.
+    const type_name = try Name.parse("_x._udp.local");
+    const inst_name = try Name.parse("a._x._udp.local");
+    var rd: [300]u8 = undefined;
+    const n = try inst_name.encode(&rd);
+    _ = q.cache.upsert(.{ .name = type_name, .rtype = .ptr, .class = wire.class_in, .ttl_s = 4500, .rdata = rd[0..n], .ifindex = 1 }, 0, false, .none);
+    q.recomputeDeadline(); // a direct cache write bypasses `handle`'s memo update
+    const expiry = q.nextDeadline();
+    try testing.expectEqual(@as(?u64, timers.s(4500)), expiry);
+
+    // Reserved: the slot and the duplicate check are taken, no query is
+    // scheduled, no warm start, the next timer is still the expiry.
+    const id = try q.reserveBrowse("_x._udp");
+    try testing.expectError(error.DuplicateBrowse, q.reserveBrowse("_x._udp"));
+    try testing.expectError(error.DuplicateBrowse, q.browse("_x._udp", 0, sink));
+    try testing.expectEqual(@as(usize, 1), q.browseCount());
+    try testing.expectEqual(expiry, q.nextDeadline());
+    try testing.expectEqual(@as(usize, 0), col.found);
+    q.tick(timers.s(10), &pairs, sink);
+    try testing.expect(!q.hasPendingTx());
+    q.restartSchedules(timers.s(10));
+    try testing.expectEqual(expiry, q.nextDeadline());
+
+    // Started at 10 s: first query 20-120 ms from then, warm start now.
+    q.startBrowse(id, timers.s(10), sink);
+    try testing.expectEqual(@as(usize, 1), col.found);
+    const due = q.nextDeadline().?;
+    try testing.expect(due >= timers.s(10) + 20_000 and due <= timers.s(10) + 120_000);
+    // Starting twice is a no-op.
+    q.startBrowse(id, timers.s(20), sink);
+    try testing.expectEqual(@as(?u64, due), q.nextDeadline());
+    try testing.expectEqual(@as(usize, 1), col.found);
+
+    // A reserved id can be stopped like a started one.
+    const id2 = try q.reserveBrowse("_y._udp");
+    try testing.expectEqual(@as(usize, 2), q.browseCount());
+    q.stopBrowse(id2, timers.s(20));
+    try testing.expectEqual(@as(usize, 1), q.browseCount());
+    q.startBrowse(id2, timers.s(20), sink); // stopped: no-op
+    try testing.expectEqual(@as(usize, 1), q.browseCount());
+    _ = try q.reserveBrowse("_y._udp"); // the slot is free again
 }
 
 test "resolve-join decision emits once and again on change" {

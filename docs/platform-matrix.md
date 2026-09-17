@@ -111,7 +111,7 @@ accepts the numbers regardless of the macro; we hard-code the 3542 set.
 | OS daemon | mDNSResponder, binds 5353 with `SO_REUSEPORT` | avahi-daemon as uid `avahi` (`SO_REUSEADDR` + `SO_REUSEPORT`) **and** systemd-resolved (`MulticastDNS=` on): on Fedora 44 both hold `0.0.0.0:5353` and `[::]:5353` at once (`ss -ulnp`), so `firstBinder()` is `true` only when both are stopped | none by default | none by default |
 | Coexistence rule | `SO_REUSEPORT` required; `SO_REUSEADDR` alone fails (M0 spike, see below) | `SO_REUSEADDR` required across uids; `SO_REUSEPORT` alone fails cross-uid; set both (M2: bind as a plain user beside root-owned systemd-resolved and uid-`avahi` avahi-daemon succeeded with both set; the single-flag cases were not re-measured on Linux) | set both | set both |
 | Unicast delivery when shared | exactly one socket receives; which one is an OS detail recorded below and never relied on | hash-balanced among same-uid sockets; never relied on | one socket | one socket |
-| Egress interface selection | `IP_PKTINFO` / `IPV6_PKTINFO` cmsg per send | pktinfo cmsg per send | `IPV6_PKTINFO` cmsg; v4 via `IP_MULTICAST_IF` per send | `IPV6_PKTINFO` cmsg; v4 via `IP_MULTICAST_IF` per send |
+| Egress interface selection | `IP_PKTINFO` / `IPV6_PKTINFO` cmsg per send, plus `IP_MULTICAST_IF` (`ip_mreqn{ifindex, addr}`) set before every v4 multicast send (the `lo0` route-cache quirk, see "macOS runs (M5)") | pktinfo cmsg per send | `IPV6_PKTINFO` cmsg; v4 via `IP_MULTICAST_IF` per send | `IPV6_PKTINFO` cmsg; v4 via `IP_MULTICAST_IF` per send |
 | Arrival interface | `IP_PKTINFO` (`ipi_ifindex`) and `IPV6_PKTINFO` (`ipi6_ifindex`) | `IP_PKTINFO`, `IPV6_PKTINFO` | `IP_RECVIF` (`sockaddr_dl.sdl_index`), `IPV6_PKTINFO` | `IP_RECVIF`, `IPV6_PKTINFO` |
 | Destination address (RFC 6762 §11 and the QU window) | `IP_PKTINFO` (`ipi_addr`), `IPV6_PKTINFO` (`ipi6_addr`); decoded on 104/104 datagrams in the M0 spike | `IP_PKTINFO`, `IPV6_PKTINFO`; 100 % in the M2 runs | `IP_RECVDSTADDR`, `IPV6_PKTINFO` (unverified) | `IP_RECVDSTADDR`, `IPV6_PKTINFO` (unverified) |
 | Datagram without a destination cmsg (option silently ineffective, `MSG_CTRUNC`) | `Service` counts it in `RxCounters.no_dst` and hands it to the Engine with `dst_known = false`: the §11 on-link check still runs as for a unicast destination, the QU-window drop (`dropped_unicast_unexpected`) does not, and `Engine.stats().rx_dst_unknown` counts it. Without this every multicast response on such a socket would be dropped and a browse would die with nothing but counters to show for it. | same | same | same |
@@ -668,3 +668,22 @@ RESULT bind=OK first_binder=false joined_v4=1 joined_v6=1 rx_v4_ifindex=34 rx_v6
 No `join_failed` or `addrs_truncated` warning in either run; the `en0`
 run joined exactly one ifindex per family. The v6 side of the full run
 also joined the `utun` interfaces (link-local only, no v4), as in M0.
+
+## macOS runs (M5)
+
+2026-09-16, macOS 26, C spike and then `tests/loop_test.zig` (two
+Services on `lo0`, v4 only). With `IP_MULTICAST_IF` unset on the
+socket, a v4 multicast `sendmsg` whose `IP_PKTINFO` names `lo0`
+succeeds once and every later send on that socket fails with
+`ENETUNREACH`: the socket's cached route no longer matches the pktinfo
+interface. `en0` and the other interfaces are unaffected. The fix in
+`Service.sendDatagram` (`pktinfo_needs_multicast_if`, Darwin only):
+before each v4 multicast send, a best-effort
+`setsockopt(IP_MULTICAST_IF, ip_mreqn{ifindex, addr})` for the egress
+interface, then the pktinfo cmsg send as before. With it the loopback
+tests (`serve returns Canceled after group.cancel and a peer sees
+goodbye`, `lookup returns after quiet_us with one result`, `lookup
+replaces an earlier resolved for the same instance`) exchange probes,
+announcements and goodbyes over `lo0` repeatably; `tx_dropped` stays 0.
+The v6 path (`IPV6_PKTINFO` only) did not show the quirk and is
+unchanged.

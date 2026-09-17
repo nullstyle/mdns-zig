@@ -14,7 +14,7 @@
         "CHANGELOG.md",
         "LICENSE",
         "src",
-        "examples", // created in M4; zig fetch tolerates the missing path until then
+        "examples",
         "docs",
     },
 }

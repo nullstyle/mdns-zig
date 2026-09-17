@@ -166,6 +166,14 @@ pub const FakeResponder = struct {
         return r.pending_len == 0;
     }
 
+    /// Due time of the soonest queued answer, or null when idle (for a
+    /// deadline-driven loop: jump here rather than crawl to it).
+    pub fn nextDueUs(r: *const FakeResponder) ?u64 {
+        var best: ?u64 = null;
+        for (r.pending[0..r.pending_len]) |*p| best = if (best) |b| @min(b, p.due_us) else p.due_us;
+        return best;
+    }
+
     /// Withdraw `table[idx]` at once: one multicast packet from the v4
     /// source with the PTR, SRV, TXT and addresses at TTL 0 (RFC 6762
     /// section 10.1); the row is not answered again.

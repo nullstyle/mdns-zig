@@ -206,6 +206,9 @@ pub const Filter = struct {
     segment: ?u32 = null,
     kind: ?PacketKind = null,
     family: ?mdns.Family = null,
+    /// `true`: only datagrams to a multicast group; `false`: only
+    /// unicast ones (legacy and QU replies, unicast probe defences).
+    multicast: ?bool = null,
     from_us: u64 = 0,
     to_us: u64 = std.math.maxInt(u64),
 
@@ -215,6 +218,7 @@ pub const Filter = struct {
         if (f.segment) |v| if (s.segment != v) return false;
         if (f.kind) |v| if (s.kind != v) return false;
         if (f.family) |v| if (s.family != v) return false;
+        if (f.multicast) |v| if (s.isMulticast() != v) return false;
         if (s.now_us < f.from_us or s.now_us >= f.to_us) return false;
         return true;
     }
@@ -333,6 +337,8 @@ test "budget helpers count sent datagrams in a window" {
     try testing.expectEqual(@as(usize, 1), countSent(&log, .{ .from_engine = 1 }));
     try testing.expectEqual(@as(usize, 1), countSent(&log, .{ .family = .v6 }));
     try testing.expectEqual(@as(usize, 0), countSent(&log, .{ .ifindex = 2 }));
+    try testing.expectEqual(@as(usize, 4), countSent(&log, .{ .multicast = true }));
+    try testing.expectEqual(@as(usize, 0), countSent(&log, .{ .multicast = false }));
     try expectBudget(&log, .{ .kind = .query }, 3);
     try expectAtLeast(&log, .{}, 4);
     try testing.expectEqual(@as(usize, 2), maxInWindow(&log, .{ .kind = .query }, us_per_s));

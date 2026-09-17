@@ -44,11 +44,11 @@ disclosure; if a fix ships earlier, disclosure follows the release.
 
 | Version | Supported |
 |---|---|
-| 0.1.x (once released) | yes |
+| 0.1.x | yes |
 | unreleased `main` | best effort; report anyway |
 
-Until 0.1.0 is tagged there is no released version; reports against
-`main` are still welcome.
+0.1.0 is the first release (2026-09-16). Fixes land on `main` and ship as
+the next 0.1.x tag; reports against `main` are welcome too.
 
 ## Scope
 
@@ -60,14 +60,24 @@ In scope:
   compression loops, truncated records, oversized TXT, bad NSEC bitmaps).
 - Algorithmic-complexity attacks (for example pointer chasing in name
   decompression or cache-key hashing) and unbounded resource use beyond
-  the documented `Config` caps.
+  the documented `Limits` caps.
 - Flood-guard failures: input that makes this library send more than
   the RFC 6762 schedule allows (probe storms, answer amplification,
-  echo loops), since that harms the whole link.
+  echo loops), since that harms the whole link. The bounds v0.1 holds
+  (`tests/flood_guard_test.zig`, `probe storm from a hostile peer is
+  rate bounded`): a multicast defence of an owned name at most once per
+  250 ms per record and interface, whatever the probe rate (RFC 6762
+  §6, exempt from the 1 s rule but not unbounded); a QU probe gets one
+  unicast reply, to the on-link source address only, never re-sent, so
+  the byte ratio towards a spoofed source stays about 1.5x (SRV + TXT +
+  address + NSEC for one name, asserted under 2x). There is no per-source
+  cap on those unicast replies beyond one per probe (a follow-up for M6);
+  sending more than one reply per probe, or a multicast reply faster
+  than the 250 ms spacing, is in scope.
 
 Out of scope:
 
-- Issues that require a `Config` with a documented safety cap disabled.
+- Issues that require `Limits` with a documented safety cap raised beyond its default.
 - The inherent trust model of mDNS: any host on the link may answer for
   any name. Consumers that need authenticity must verify it above this
   library (the profile modules carry identity material for that).

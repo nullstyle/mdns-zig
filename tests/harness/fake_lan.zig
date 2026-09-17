@@ -186,6 +186,10 @@ pub fn FakeLan(comptime max_engines: usize) type {
         bridges: mdns.Bounded(Bridge, max_bridges) = .{},
         sent: std.ArrayList(Sent) = .empty,
         deliveries: std.ArrayList(Delivery) = .empty,
+        /// Off: `handle` calls are made but not appended to
+        /// `deliveries` (a hundred-engine segment logs a hundred entries
+        /// per datagram; the counters and `sent` stay exact).
+        log_deliveries: bool = true,
         harness_stats: HarnessStats = .{},
         rx_buf: [max_datagram]u8 = undefined,
 
@@ -397,7 +401,7 @@ pub fn FakeLan(comptime max_engines: usize) type {
                     if (!hasFamily(iface, family)) continue;
                     const meta: RxMeta = .{ .from = scoped(from, iface.index), .ifindex = iface.index, .dst_multicast = dst_multicast };
                     n.engine.handle(bytes, meta, now_us);
-                    try lan.deliveries.append(lan.gpa, .{ .sent = null, .from_engine = null, .to_engine = ti, .meta = meta, .echo = false, .bridged = false, .now_us = now_us });
+                    if (lan.log_deliveries) try lan.deliveries.append(lan.gpa, .{ .sent = null, .from_engine = null, .to_engine = ti, .meta = meta, .echo = false, .bridged = false, .now_us = now_us });
                     count += 1;
                 }
             }
@@ -409,7 +413,7 @@ pub fn FakeLan(comptime max_engines: usize) type {
         /// ...). Logged as a foreign delivery.
         pub fn injectTo(lan: *Self, to_engine: usize, bytes: []const u8, meta: RxMeta, now_us: u64) !void {
             lan.nodes[to_engine].engine.handle(bytes, meta, now_us);
-            try lan.deliveries.append(lan.gpa, .{ .sent = null, .from_engine = null, .to_engine = to_engine, .meta = meta, .echo = false, .bridged = false, .now_us = now_us });
+            if (lan.log_deliveries) try lan.deliveries.append(lan.gpa, .{ .sent = null, .from_engine = null, .to_engine = to_engine, .meta = meta, .echo = false, .bridged = false, .now_us = now_us });
         }
 
         // ---- logs -----------------------------------------------------
@@ -506,7 +510,7 @@ pub fn FakeLan(comptime max_engines: usize) type {
                     const meta: RxMeta = .{ .from = from, .ifindex = iface.index, .dst_multicast = true };
                     n.engine.handle(s.bytes, meta, now_us);
                     lan.sent.items[sent_idx].delivered += 1;
-                    try lan.deliveries.append(lan.gpa, .{
+                    if (lan.log_deliveries) try lan.deliveries.append(lan.gpa, .{
                         .sent = sent_idx,
                         .from_engine = s.from_engine,
                         .to_engine = ti,
@@ -538,7 +542,7 @@ pub fn FakeLan(comptime max_engines: usize) type {
                     const meta: RxMeta = .{ .from = from, .ifindex = iface.index, .dst_multicast = false };
                     n.engine.handle(s.bytes, meta, now_us);
                     lan.sent.items[sent_idx].delivered += 1;
-                    try lan.deliveries.append(lan.gpa, .{
+                    if (lan.log_deliveries) try lan.deliveries.append(lan.gpa, .{
                         .sent = sent_idx,
                         .from_engine = s.from_engine,
                         .to_engine = ti,
