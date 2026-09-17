@@ -189,10 +189,12 @@ jobs:
   # so this runs the unfiltered suite. `-Duse-llvm=true` is required on
   # this x86_64 runner: the self-hosted backend emits no sancov coverage
   # and the fuzzer dies with "pcs_len was zero" (build.zig). Budget:
-  # `--fuzz=N` is N runs per target with no time flag; M1 measured 2M at
-  # about 58 s for the four codec targets on an M-series Mac (CHANGELOG),
-  # so 1M is the ~60 s calibration for the slower hosted runner, and
-  # `timeout-minutes` bounds it. Recalibrate when targets are added.
+  # `--fuzz=N` is N runs per target with no time flag. The first hosted
+  # run (2026-09-17) hit the 20-minute limit at 1M with five targets
+  # (the Engine.handle target is far slower than the codec ones), and a
+  # timeout counts as "cancelled" for the whole run despite
+  # continue-on-error. 100K keeps it well inside the limit; raise it
+  # only after measuring a run here. Recalibrate when targets are added.
   fuzz:
     name: Fuzz (advisory)
     runs-on: ubuntu-latest
@@ -216,4 +218,4 @@ jobs:
           restore-keys: zig-global-${{ runner.os }}-
 
       - name: Fuzz
-        run: zig build test -Duse-llvm=true --fuzz=1M
+        run: zig build test -Duse-llvm=true --fuzz=100K
