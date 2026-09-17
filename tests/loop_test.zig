@@ -257,6 +257,16 @@ const Reader = struct {
     }
 };
 
+const Watchdog = struct {
+    /// Closes the mailbox after `budget_ms` unless canceled first, so a
+    /// reader blocked in `next` fails with `error.Closed` instead of
+    /// hanging the suite.
+    fn run(m: *Mailbox, io: Io, budget_ms: u32) void {
+        sleepMs(io, budget_ms) catch return;
+        m.close(io);
+    }
+};
+
 test "mailbox full waits up to the cap then drops oldest and counts" {
     const io = testing.io;
     var buf: [2]Event = undefined;
@@ -315,26 +325,52 @@ test "mailbox drop emits warning.events_dropped once" {
     group.concurrent(io, Service.serve, .{ &svc, &mailbox }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
-    // Four puts into one slot after the first 250 ms step: three drops
-    // at one step cap each, then the warning's own put (which drops the
-    // third event). About 1.25 s; wait well past it before closing.
+    // Stay away long enough for at least one drop: the first put lands
+    // after the first step (one cap), the second waits one more cap and
+    // then drops it. Every 250 ms this sleeps past that point is margin
+    // for a slow runner; a longer sleep only adds drops.
     try sleepMs(io, 2_500);
-    mailbox.close(io);
-    try group.await(io);
 
+    // Then read until the warning arrives instead of assuming `serve`
+    // finished its capped puts inside a fixed budget: on the macOS CI
+    // runner it had not after 2.5 s, and the mailbox was closed under
+    // it before the drop check ran. With a getter waiting, each put is
+    // delivered as it happens (`Io.Queue` serves getters first), so
+    // `serve` drains its ring and reaches the warning at its own pace.
+    // `serve` can queue at most the four events plus one warning per
+    // family it could not bind; more reads than that is a wrong stream,
+    // not a slow one. The watchdog turns a stream with no warning at
+    // all (no drop happened, or `serve` never says so) into a failure
+    // here rather than a hang: it closes the mailbox, and `next` fails.
+    var watchdog: Io.Group = .init;
+    watchdog.concurrent(io, Watchdog.run, .{ &mailbox, io, 30_000 }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
     var warnings: usize = 0;
     var others: usize = 0;
+    const read: Mailbox.NextError!void = while (others < 16) {
+        const ev = mailbox.next(io) catch |err| break err;
+        if (ev == .warning and ev.warning == .events_dropped) {
+            warnings += 1;
+            break {};
+        }
+        others += 1;
+    } else {};
+    // Tear down in order on every outcome, then judge it: a `Closed`
+    // here is the watchdog's, that is no drop warning within 30 s.
+    watchdog.cancel(io);
+    mailbox.close(io);
+    try group.await(io);
+    try read;
+    try testing.expectEqual(@as(usize, 1), warnings);
+
+    // Nothing follows the warning: `serve` says it once per lifetime.
     while (mailbox.next(io)) |ev| {
         if (ev == .warning and ev.warning == .events_dropped) warnings += 1 else others += 1;
     } else |err| try testing.expectEqual(error.Closed, err);
-    // The one-slot mailbox can evict the warning itself: any event that
-    // lands after it (an interface refresh on a busy host, as seen on the
-    // macOS CI runner) drops the oldest slot, which is the warning. So
-    // the mailbox holds at most one copy, and the Service flag is the
-    // "exactly once" guarantee.
-    try testing.expect(warnings <= 1);
+    try testing.expectEqual(@as(usize, 1), warnings);
     try testing.expect(svc.events_dropped_warned);
-    try testing.expect(mailbox.dropped >= 3);
+    try testing.expect(mailbox.dropped >= 1);
     try testing.expectEqual(mailbox.dropped, svc.stats().events_dropped);
 }
 
