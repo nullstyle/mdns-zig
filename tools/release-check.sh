@@ -28,6 +28,13 @@ if [ "$zon_version" != "$readme_tag" ]; then
 fi
 echo "release-check: README tag and zon version agree on $zon_version"
 
+root_version=$(sed -n 's/^pub const version = "\([^"]*\)";.*$/\1/p' src/root.zig | head -n 1)
+if [ "$root_version" != "$zon_version" ]; then
+    echo "release-check: src/root.zig declares version $root_version but build.zig.zon declares $zon_version" >&2
+    exit 1
+fi
+echo "release-check: src/root.zig version agrees on $zon_version"
+
 if [ "${1:-}" != "" ] && [ "${1#refs/tags/}" != "${1:-}" ]; then
     tag="${1#refs/tags/}"
     tag="${tag#v}"

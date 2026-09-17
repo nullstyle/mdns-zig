@@ -1,7 +1,7 @@
 //! mdns-zig: std-only mDNS (RFC 6762) and DNS-SD (RFC 6763).
 const std = @import("std");
 
-pub const version = "0.1.0";
+pub const version = "0.1.1";
 
 /// UDP port every mDNS packet uses (RFC 6762 section 2).
 pub const port: u16 = 5353;
